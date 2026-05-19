@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>ModelPool tier stress</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #181820; color: #eee; font: 13px/1.4 system-ui, sans-serif; overflow: hidden; }
+  #c { display: block; width: 100vw; height: 100vh; }
+  #hud {
+    position: fixed; top: 8px; left: 8px;
+    padding: 8px 10px; background: rgba(0,0,0,.65);
+    border-radius: 6px; pointer-events: none;
+    font-variant-numeric: tabular-nums; max-width: 380px;
+  }
+  #hud b { color: #8df; }
+  #hud .tier { display: inline-block; min-width: 60px; }
+  #panel {
+    position: fixed; top: 8px; right: 8px;
+    padding: 8px 10px; background: rgba(0,0,0,.7);
+    border-radius: 6px; color: #eee; max-width: 280px;
+  }
+  #panel button { background: #335; color: #eee; border: 1px solid #557; padding: 4px 8px; margin: 2px; border-radius: 4px; font: inherit; cursor: pointer; }
+  #panel button:hover { background: #446; }
+  #panel input[type=number], #panel input[type=range] { background: #333; color: #eee; border: 1px solid #555; padding: 3px 6px; border-radius: 4px; font: inherit; width: 70px; }
+  #panel label { display: block; margin-top: 6px; }
+  #panel hr { border: 0; border-top: 1px solid #444; margin: 6px 0; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">init...</div>
+<div id="panel">
+  <div>spawn unique:
+    <button data-n="10">+10</button>
+    <button data-n="100">+100</button>
+    <button data-n="500">+500</button>
+    <button data-n="1000">+1000</button>
+  </div>
+  <div>
+    <button id="clear">clear all</button>
+  </div>
+  <hr>
+  <label>target fps: <input type="number" id="target-fps" min="20" max="144" step="5" value="60"></label>
+  <label>byte budget MB: <input type="number" id="byte-budget" min="32" max="2048" step="32" value="256"></label>
+  <hr>
+  <label><input type="checkbox" id="orbit-cam" checked> orbit camera</label>
+  <label><input type="checkbox" id="zoom-cycle" checked> zoom cycle (fly-through)</label>
+</div>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/",
+    "@pixiv/three-vrm": "https://cdn.jsdelivr.net/npm/@pixiv/three-vrm@3.4.0/lib/three-vrm.module.min.js"
+  }
+}
+</script>
+<script type="module" src="./stress.js"></script>
+</body>
+</html>

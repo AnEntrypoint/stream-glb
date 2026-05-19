@@ -1,0 +1,57 @@
+{
+  "name": "@anentrypoint/stream-glb",
+  "version": "0.1.0",
+  "description": "Local-first progressive GLB/VRM streaming for three.js. Bake. Stream. Render 1000+ unique assets at 35+ fps.",
+  "type": "module",
+  "license": "MIT",
+  "author": "AnEntrypoint",
+  "homepage": "https://anentrypoint.github.io/stream-glb",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AnEntrypoint/stream-glb.git"
+  },
+  "bugs": {
+    "url": "https://github.com/AnEntrypoint/stream-glb/issues"
+  },
+  "keywords": [
+    "three.js",
+    "glb",
+    "vrm",
+    "progressive",
+    "lod",
+    "streaming",
+    "meshopt",
+    "draco"
+  ],
+  "files": [
+    "runtime",
+    "tools",
+    "examples"
+  ],
+  "exports": {
+    ".": "./runtime/model-pool.js",
+    "./lod-worker": "./runtime/lod-worker.js",
+    "./bake-progressive": "./tools/bake-progressive.mjs",
+    "./bake-all": "./tools/bake-all.mjs"
+  },
+  "scripts": {
+    "bake": "node tools/bake-progressive.mjs",
+    "bake:all": "node tools/bake-all.mjs",
+    "serve": "node examples/stress/serve.mjs",
+    "site:build": "npx --yes flatspace@latest build"
+  },
+  "peerDependencies": {
+    "three": ">= 0.160.0"
+  },
+  "dependencies": {
+    "draco3dgltf": "^1.5.7"
+  },
+  "devDependencies": {
+    "@gltf-transform/core": "^4.3.0",
+    "@gltf-transform/extensions": "^4.3.0",
+    "@gltf-transform/functions": "^4.3.0",
+    "meshoptimizer": "^1.1.1",
+    "sharp": "^0.34.5",
+    "three": ">= 0.170.0"
+  }
+}

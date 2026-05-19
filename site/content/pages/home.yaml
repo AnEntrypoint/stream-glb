@@ -1,0 +1,134 @@
+id: home
+title: home
+hero:
+  heading: "stream-glb"
+  subheading: "local-first progressive GLB / VRM streaming for three.js"
+  body: "Bake any glb or vrm into a per-LOD progressive bundle. Stream over HTTP range requests. Render 1000+ unique assets at 35+ fps with GPU-side frustum culling and a 4-worker decode pool. Skinning and morph targets preserved."
+  badges:
+    - label: "1000+ entities"
+    - label: "35 fps steady"
+    - label: "GPU frustum cull"
+    - label: "worker pool"
+    - label: "VRM 0.0"
+  ctas:
+    - label: "github ↗"
+      href: "https://github.com/AnEntrypoint/stream-glb"
+      primary: true
+    - label: "stress test ↗"
+      href: "https://anentrypoint.github.io/stream-glb/stress/"
+
+receipt:
+  heading: "receipt"
+  rows:
+    - ["status", "live"]
+    - ["lang", "javascript · ES modules"]
+    - ["deps", "three · gltf-transform · meshoptimizer · sharp · draco3dgltf"]
+    - ["target", "WebGL2 · modern Chromium / Firefox / Safari"]
+    - ["bundle", "examples drive a static server with HTTP range support"]
+    - ["license", "MIT"]
+    - ["witnessed", "1100 unique entities @ 35.8 fps · 154k tris · 51 draws"]
+
+features:
+  heading: "what it does"
+  items:
+    - name: "bakes any glb or vrm"
+      desc: "tools/bake-progressive.mjs runs gltf-transform + meshopt + sharp to emit a root .progressive.glb plus sibling LOD files (.webp textures, decimated mesh shards). draco-compressed inputs supported."
+      meta: "tools/bake-progressive.mjs"
+    - name: "auto-discovers baked assets"
+      desc: "runtime fetches /assets-list.json at boot. server walks an asset directory; client picks any subset for the stress test."
+      meta: "examples/stress/serve.mjs"
+    - name: "off-main-thread decode"
+      desc: "4-worker pool fetches sibling LODs, parses with GLTFLoader+MeshoptDecoder, posts back transferable typed arrays. main thread rebuilds BufferGeometry shells, no per-vertex JS."
+      meta: "runtime/lod-worker.js"
+    - name: "GPU vertex-shader cull"
+      desc: "InstancedSlot patches material onBeforeCompile. per-instance bound sphere as attribute, projViewMatrix as uniform. out-of-frustum instances collapse to NaN. 540k tris -> 154k tris at 1100 ents."
+      meta: "runtime/model-pool.js"
+    - name: "scene-graph pruning"
+      desc: "entities that fully bind to an InstancedSlot detach their root from the scene tree. no per-entity Object3D walk for the FAR tier."
+      meta: "Entity._maybeDetach"
+    - name: "adaptive FPS+VRAM ceiling"
+      desc: "every 30 frames the pool reads EMA fps; if under target drops LOD ceiling, raises midPx (more entities to FAR), reduces heroCap. opposite on headroom. byte budget evicts non-inline LODs nobody references."
+      meta: "ModelPool.update"
+
+quickstart:
+  heading: "quick start"
+  lines:
+    - kind: "cmt"
+      text: "bake every glb/vrm in a directory tree"
+    - kind: "cmd"
+      text: "npm i three @gltf-transform/core @gltf-transform/extensions @gltf-transform/functions meshoptimizer sharp draco3dgltf"
+    - kind: "cmd"
+      text: "PARALLEL=8 node tools/bake-all.mjs ./my-models"
+    - kind: "cmt"
+      text: "serve the bakes + runtime"
+    - kind: "cmd"
+      text: "ASSETS_DIR=./my-models node examples/stress/serve.mjs"
+    - kind: "cmt"
+      text: "open in browser"
+    - kind: "cmd"
+      text: "http://127.0.0.1:5180/"
+
+api_exports:
+  heading: "public api"
+  items:
+    - name: "ModelPool"
+      desc: "constructor opts: scene, renderer, camera, targetFps, byteBudget, maxConcurrentFetches, workerCount, animationThrottleDistance, heroPx, midPx, heroCap. methods: spawn(url, opts), update(), getStats(), event emitters."
+      meta: "runtime/model-pool.js"
+    - name: "Entity proxy"
+      desc: "returned by spawn(). .root is an Object3D, .dispose() releases all resources. emits 'ready', 'lod-changed', 'disposed', 'error'."
+      meta: "runtime/model-pool.js"
+    - name: "bake-progressive"
+      desc: "CLI: node tools/bake-progressive.mjs <input.glb|vrm> <out-dir>"
+      meta: "tools/bake-progressive.mjs"
+    - name: "bake-all"
+      desc: "CLI: node tools/bake-all.mjs <dir> [<dir>...]  (recursive, parallel via PARALLEL env)"
+      meta: "tools/bake-all.mjs"
+
+examples:
+  heading: "live examples"
+  items:
+    - name: "stress test"
+      desc: "spawn 10 / 100 / 500 / 1000 unique entities into a grid. orbit camera with cosine zoom. HUD shows fps + tier counts + per-phase ms + draws + tris."
+      cta: "stress.html"
+      href: "https://anentrypoint.github.io/stream-glb/stress/"
+
+sidebar:
+  fab:
+    glyph: "◆"
+    label: "open"
+    href: "https://github.com/AnEntrypoint/stream-glb"
+  bins:
+    - glyph: "§"
+      label: "readme"
+      href: "https://github.com/AnEntrypoint/stream-glb#readme"
+    - glyph: "§"
+      label: "source"
+      href: "https://github.com/AnEntrypoint/stream-glb"
+    - glyph: "§"
+      label: "releases"
+      href: "https://github.com/AnEntrypoint/stream-glb/releases"
+  labels_group: "modules"
+  labels:
+    - glyph: "›"
+      label: "runtime/model-pool"
+      href: "https://github.com/AnEntrypoint/stream-glb/blob/main/runtime/model-pool.js"
+    - glyph: "›"
+      label: "runtime/lod-worker"
+      href: "https://github.com/AnEntrypoint/stream-glb/blob/main/runtime/lod-worker.js"
+    - glyph: "›"
+      label: "tools/bake-progressive"
+      href: "https://github.com/AnEntrypoint/stream-glb/blob/main/tools/bake-progressive.mjs"
+    - glyph: "›"
+      label: "tools/bake-all"
+      href: "https://github.com/AnEntrypoint/stream-glb/blob/main/tools/bake-all.mjs"
+    - glyph: "›"
+      label: "examples/stress"
+      href: "https://github.com/AnEntrypoint/stream-glb/tree/main/examples/stress"
+
+status_left:
+  - "main"
+  - "• javascript"
+  - "• 0 errors"
+status_right:
+  - "stream-glb"
+  - "• MIT"
