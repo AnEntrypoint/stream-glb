@@ -27,25 +27,17 @@ await mkdir(path.join(dist, 'runtime'), { recursive: true });
 await cp(path.join(repoRoot, 'runtime/model-pool.js'), path.join(dist, 'runtime/model-pool.js'));
 await cp(path.join(repoRoot, 'runtime/lod-worker.js'), path.join(dist, 'runtime/lod-worker.js'));
 
-// Patch stress.html to point at ./stress.js and the runtime via the
-// site-absolute path that GitHub Pages serves (./../runtime/...).
-const stressHtmlPath = path.join(dist, 'stress/index.html');
+// stress.js source-of-truth uses `from '/runtime/model-pool.js'` — on
+// GH Pages under /stream-glb/stress/ that absolute path is wrong; rewrite
+// to a relative path in the deployed copy. The runtime layout under
+// dist/runtime/ mirrors the repo runtime/ so '../runtime/...' resolves.
+// We do NOT rewrite '/assets-list.json' — stress.js handles 404 by
+// falling back to the remote manifest at anentrypoint.github.io/assets/.
 const { readFile } = await import('node:fs/promises');
-let html = await readFile(stressHtmlPath, 'utf8');
-// stress.js currently does `import { ModelPool } from '/runtime/model-pool.js'`.
-// On GH Pages under /stream-glb/stress/, that resolves to the wrong place;
-// rewrite to a relative path in the copy.
 let stressJs = await readFile(path.join(dist, 'stress/stress.js'), 'utf8');
 stressJs = stressJs.replace(
   "from '/runtime/model-pool.js'",
   "from '../runtime/model-pool.js'"
-);
-await writeFile(path.join(dist, 'stress/stress.js'), stressJs);
-// Disable static-asset-list fetch on the deployed page since GH Pages
-// doesn't have one. Users can paste a custom URL.
-stressJs = stressJs.replace(
-  "fetch('/assets-list.json')",
-  "fetch('./assets-list.json')"
 );
 await writeFile(path.join(dist, 'stress/stress.js'), stressJs);
 

@@ -4,13 +4,49 @@
 import * as THREE from 'three';
 import { ModelPool } from '/runtime/model-pool.js';
 
-// Asset list fetched from server /assets-list.json at boot. Server walks
-// the examples/local-progressive directory and emits every output_* dir.
-let ASSET_DIRS = [];
-const ASSET_DIRS_READY = fetch('/assets-list.json')
-  .then((r) => r.json())
-  .then((list) => { ASSET_DIRS = list; console.log(`[stress] ${list.length} assets discovered`); return list; })
-  .catch((e) => { console.error('[stress] asset-list fetch failed', e); ASSET_DIRS = []; });
+// Asset discovery has two modes:
+//  1. local dev — fetch('/assets-list.json'), an array of `output_*` dir
+//     names, served by examples/stress/serve.mjs scanning the local
+//     baked-asset directory. URLs are `${dir}/model.progressive.glb`.
+//  2. deployed — fetch the AnEntrypoint/assets repo's manifest.baked.json,
+//     which is `{ Category: [{name, path, thumb, baked}] }`. URLs are
+//     `https://anentrypoint.github.io/assets/${entry.baked}`.
+// We try (1) first; if it 404s OR returns the wrong shape, fall back to (2).
+let ASSET_URLS = [];
+const ASSETS_BASE = 'https://anentrypoint.github.io/assets/';
+const ASSET_DIRS_READY = (async () => {
+  // Try local
+  try {
+    const r = await fetch('/assets-list.json');
+    if (r.ok) {
+      const body = await r.json();
+      if (Array.isArray(body) && body.length && typeof body[0] === 'string') {
+        ASSET_URLS = body.map((d) => `/${d}/model.progressive.glb`);
+        console.log(`[stress] ${ASSET_URLS.length} local assets discovered`);
+        return ASSET_URLS;
+      }
+    }
+  } catch {}
+  // Fall back to remote manifest
+  try {
+    const r = await fetch(ASSETS_BASE + 'manifest.baked.json');
+    if (!r.ok) throw new Error('manifest.baked.json ' + r.status);
+    const m = await r.json();
+    const flat = [];
+    for (const cat of Object.values(m)) {
+      for (const entry of cat) {
+        if (entry.baked) flat.push(ASSETS_BASE + entry.baked);
+      }
+    }
+    ASSET_URLS = flat;
+    console.log(`[stress] ${ASSET_URLS.length} remote assets from ${ASSETS_BASE}`);
+    return ASSET_URLS;
+  } catch (e) {
+    console.error('[stress] asset discovery failed (both local + remote)', e);
+    ASSET_URLS = [];
+    return ASSET_URLS;
+  }
+})();
 
 const canvas = document.getElementById('c');
 const hud = document.getElementById('hud');
@@ -47,13 +83,10 @@ const proxies = new Set();
 
 async function spawnUnique(n) {
   await ASSET_DIRS_READY;
-  if (!ASSET_DIRS.length) {
+  if (!ASSET_URLS.length) {
     console.error('[stress] no assets available to spawn');
     return;
   }
-  // Distribute entities across a square grid; each entity picks an asset
-  // from the full ASSET_DIRS list (modulo), so up to len(ASSET_DIRS) of
-  // them are unique.
   const side = Math.ceil(Math.sqrt(n));
   const spacing = 1.5;
   let count = 0;
@@ -61,8 +94,8 @@ async function spawnUnique(n) {
     for (let col = 0; col < side && count < n; col++) {
       const x = (col - side / 2) * spacing;
       const z = (row - side / 2) * spacing;
-      const asset = ASSET_DIRS[count % ASSET_DIRS.length];
-      const proxy = pool.spawn(`${asset}/model.progressive.glb`, {
+      const url = ASSET_URLS[count % ASSET_URLS.length];
+      const proxy = pool.spawn(url, {
         position: [x, 0, z],
         rotation: [0, (count * 0.137) % (Math.PI * 2), 0],
         static: true,
