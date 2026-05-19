@@ -10,6 +10,7 @@ hero:
     - label: "GPU frustum cull"
     - label: "worker pool"
     - label: "VRM 0.0"
+    - label: "auto-deploys on every push"
   ctas:
     - label: "github ↗"
       href: "https://github.com/AnEntrypoint/stream-glb"
