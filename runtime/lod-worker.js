@@ -165,14 +165,62 @@ function payloadTransferables(payload) {
   return list;
 }
 
+// Build a valid GLB byte buffer from a glTF JSON spec + a BIN payload. Used
+// by the streaming-GLB code path: the worker fetches a byte-range slice of
+// the source GLB and wraps it in a tiny standalone GLB referring to just
+// one LOD's accessors.
+function composeSubGLB(jsonSpec, binBytes) {
+  const enc = new TextEncoder();
+  let jsonBytes = enc.encode(JSON.stringify(jsonSpec));
+  const jsonPad = (4 - (jsonBytes.byteLength % 4)) % 4;
+  if (jsonPad) {
+    const padded = new Uint8Array(jsonBytes.byteLength + jsonPad);
+    padded.set(jsonBytes, 0);
+    for (let i = 0; i < jsonPad; i++) padded[jsonBytes.byteLength + i] = 0x20;
+    jsonBytes = padded;
+  }
+  const binPad = (4 - (binBytes.byteLength % 4)) % 4;
+  const binLen = binBytes.byteLength + binPad;
+  const total = 12 + 8 + jsonBytes.byteLength + 8 + binLen;
+  const out = new Uint8Array(total);
+  const dv = new DataView(out.buffer);
+  dv.setUint32(0, 0x46546c67, true);
+  dv.setUint32(4, 2, true);
+  dv.setUint32(8, total, true);
+  let off = 12;
+  dv.setUint32(off, jsonBytes.byteLength, true); off += 4;
+  dv.setUint32(off, 0x4e4f534a, true); off += 4;
+  out.set(jsonBytes, off); off += jsonBytes.byteLength;
+  dv.setUint32(off, binLen, true); off += 4;
+  dv.setUint32(off, 0x004e4942, true); off += 4;
+  out.set(binBytes, off);
+  return out;
+}
+
 self.addEventListener('message', async (ev) => {
-  const { id, url, decodeAABB } = ev.data;
+  const { id, url, decodeAABB, streaming, byteOffset, byteLength, jsonSpec, binBase } = ev.data;
   try {
     const ok = await readyPromise;
     if (!ok || !loader) throw new Error('worker not initialized');
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`fetch ${url}: ${res.status}`);
-    const buf = await res.arrayBuffer();
+    let buf;
+    if (streaming) {
+      // Range-request the LOD's contiguous byte slice from the source GLB.
+      // byteOffset is RELATIVE to the BIN chunk; binBase is the file-offset
+      // where the BIN payload starts (after GLB header + JSON chunk).
+      const absStart = (binBase || 0) + byteOffset;
+      const absEnd = absStart + byteLength - 1;
+      const res = await fetch(url, { headers: { Range: `bytes=${absStart}-${absEnd}` } });
+      if (!res.ok && res.status !== 206) throw new Error(`fetch ${url} range ${absStart}-${absEnd}: ${res.status}`);
+      let bin = new Uint8Array(await res.arrayBuffer());
+      if (res.status === 200 && bin.byteLength > byteLength) {
+        bin = bin.subarray(absStart, absStart + byteLength);
+      }
+      buf = composeSubGLB(jsonSpec, bin).buffer;
+    } else {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`fetch ${url}: ${res.status}`);
+      buf = await res.arrayBuffer();
+    }
     const gltf = await new Promise((resolve, reject) => {
       loader.parse(buf, '', resolve, reject);
     });

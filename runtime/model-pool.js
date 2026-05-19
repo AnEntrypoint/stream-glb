@@ -42,6 +42,43 @@ function _makeLoader(includeVrm) {
   return l;
 }
 
+// --- GLB composition for streaming sub-LODs -------------------------------
+// Given a minimal glTF JSON spec (single buffer of byteLength = bin.length)
+// and a Uint8Array BIN payload, build a valid GLB byte buffer. Padding rules
+// per the GLB spec: JSON chunk padded with 0x20 (spaces) to 4-byte align;
+// BIN chunk padded with 0x00 to 4-byte align.
+function _composeSubGLB(jsonSpec, binBytes) {
+  const enc = new TextEncoder();
+  let jsonBytes = enc.encode(JSON.stringify(jsonSpec));
+  const jsonPad = (4 - (jsonBytes.byteLength % 4)) % 4;
+  if (jsonPad) {
+    const padded = new Uint8Array(jsonBytes.byteLength + jsonPad);
+    padded.set(jsonBytes, 0);
+    for (let i = 0; i < jsonPad; i++) padded[jsonBytes.byteLength + i] = 0x20;
+    jsonBytes = padded;
+  }
+  const binPad = (4 - (binBytes.byteLength % 4)) % 4;
+  const binLen = binBytes.byteLength + binPad;
+  const total = 12 /* header */ + 8 + jsonBytes.byteLength + 8 + binLen;
+  const out = new Uint8Array(total);
+  const dv = new DataView(out.buffer);
+  // GLB header: magic 'glTF', version 2, length.
+  dv.setUint32(0, 0x46546c67, true); // 'glTF'
+  dv.setUint32(4, 2, true);
+  dv.setUint32(8, total, true);
+  // JSON chunk
+  let off = 12;
+  dv.setUint32(off, jsonBytes.byteLength, true); off += 4;
+  dv.setUint32(off, 0x4e4f534a, true); off += 4; // 'JSON'
+  out.set(jsonBytes, off); off += jsonBytes.byteLength;
+  // BIN chunk
+  dv.setUint32(off, binLen, true); off += 4;
+  dv.setUint32(off, 0x004e4942, true); off += 4; // 'BIN\0'
+  out.set(binBytes, off);
+  // trailing pad bytes default to 0 already (Uint8Array init).
+  return out;
+}
+
 // --- tiny EventEmitter ----------------------------------------------------
 class Emitter {
   constructor() { this._listeners = new Map(); }
@@ -273,6 +310,106 @@ class Asset {
     return buf;
   }
 
+  // HTTP byte-range fetch — used by the streaming-GLB path to pull just the
+  // BIN slice owning a single LOD's bufferViews. byteOffset here is
+  // RELATIVE to the BIN chunk; we add _binBase to get an absolute file
+  // offset for the Range header.
+  async _fetchRange(url, byteOffset, byteLength) {
+    const absStart = (this._binBase || 0) + byteOffset;
+    const absEnd = absStart + byteLength - 1;
+    const res = await fetch(url, { headers: { Range: `bytes=${absStart}-${absEnd}` } });
+    // 206 Partial Content is the expected status; some dev servers may
+    // return 200 with the full file if Range isn't honored — accept both.
+    if (!res.ok && res.status !== 206) throw new Error(`fetch ${url} range ${absStart}-${absEnd}: ${res.status}`);
+    const buf = new Uint8Array(await res.arrayBuffer());
+    if (res.status === 200 && buf.byteLength > byteLength) {
+      // Server ignored Range — slice client-side using absolute offset.
+      return buf.subarray(absStart, absStart + byteLength);
+    }
+    return buf;
+  }
+
+  // Build a minimal-glTF JSON spec for ONE mesh LOD: a single mesh+primitive
+  // referencing the LOD's accessors (POSITION, NORMAL, INDICES, ...), with
+  // bufferViews remapped to byteOffsets relative to a freshly-zeroed BIN
+  // buffer whose total length === target.byteLength.
+  _buildStreamingLodSpec(target) {
+    const accs = this._streamAccessors;
+    const bvs = this._streamBufferViews;
+    if (!accs || !bvs) throw new Error('streaming: missing accessor/bufferView tables');
+    const attrAccs = target.attrAccs || {};
+    // Collect every accessor index used by this LOD (indices + attributes).
+    const accIndices = new Set();
+    if (target.indicesAcc != null) accIndices.add(target.indicesAcc);
+    for (const k of Object.keys(attrAccs)) accIndices.add(attrAccs[k]);
+    // Each used accessor refers to a bufferView; collect those.
+    const bvOldToNew = new Map();
+    const newBvs = [];
+    for (const ai of accIndices) {
+      const a = accs[ai];
+      if (!a || a.bufferView == null) continue;
+      if (bvOldToNew.has(a.bufferView)) continue;
+      const bv = bvs[a.bufferView];
+      if (!bv) continue;
+      // The contiguous range [target.byteOffset .. +byteLength) holds ALL
+      // these bufferViews. Remap each bv's byteOffset to be relative to
+      // target.byteOffset, into a new single-buffer glTF.
+      const newOffset = bv.byteOffset - target.byteOffset;
+      if (newOffset < 0 || newOffset + bv.byteLength > target.byteLength) {
+        throw new Error(`streaming: bufferView ${a.bufferView} (offset ${bv.byteOffset}, len ${bv.byteLength}) out of LOD range [${target.byteOffset}, ${target.byteOffset + target.byteLength})`);
+      }
+      const nb = { buffer: 0, byteOffset: newOffset, byteLength: bv.byteLength };
+      if (bv.byteStride != null) nb.byteStride = bv.byteStride;
+      if (bv.target != null) nb.target = bv.target;
+      bvOldToNew.set(a.bufferView, newBvs.length);
+      newBvs.push(nb);
+    }
+    // Build new accessor list, in a deterministic order, capturing old->new
+    // index map so primitive references stay valid.
+    const accOldToNew = new Map();
+    const newAccs = [];
+    for (const ai of accIndices) {
+      const a = accs[ai];
+      if (!a) continue;
+      const newBv = bvOldToNew.get(a.bufferView);
+      if (newBv == null) continue;
+      const nA = {
+        bufferView: newBv,
+        byteOffset: a.byteOffset,
+        componentType: a.componentType,
+        count: a.count,
+        type: a.type,
+      };
+      if (a.normalized) nA.normalized = true;
+      if (a.min) nA.min = a.min;
+      if (a.max) nA.max = a.max;
+      accOldToNew.set(ai, newAccs.length);
+      newAccs.push(nA);
+    }
+    const primitive = { attributes: {} };
+    for (const k of Object.keys(attrAccs)) {
+      const mapped = accOldToNew.get(attrAccs[k]);
+      if (mapped != null) primitive.attributes[k] = mapped;
+    }
+    if (target.indicesAcc != null) {
+      const mapped = accOldToNew.get(target.indicesAcc);
+      if (mapped != null) primitive.indices = mapped;
+    }
+    const spec = {
+      asset: { version: '2.0', generator: 'gltf-progressive streaming sub-GLB' },
+      buffers: [{ byteLength: target.byteLength }],
+      bufferViews: newBvs,
+      accessors: newAccs,
+      meshes: [{ primitives: [primitive] }],
+      nodes: [{ mesh: 0 }],
+      scenes: [{ nodes: [0] }],
+      scene: 0,
+    };
+    if (this._streamExtensionsUsed) spec.extensionsUsed = this._streamExtensionsUsed;
+    if (this._streamExtensionsRequired) spec.extensionsRequired = this._streamExtensionsRequired;
+    return spec;
+  }
+
   async _load() {
     this.state = 'loading';
     try {
@@ -283,6 +420,52 @@ class Asset {
       this.rootGltf = gltf;
       this.hasVRM = !!gltf.userData?.vrm;
       const ext = gltf.parser.json?.extras?.LOCAL_progressive;
+      // Streaming mode: a single .glb hosts every LOD's bufferViews inside
+      // its BIN chunk. Sibling fetches are replaced by HTTP Range requests
+      // against `this.url`. We need the JSON descriptor in scope to look up
+      // accessor + bufferView records when building the per-LOD sub-GLB.
+      this.streamingMode = !!(ext && ext.streaming === true && ext.version >= 2);
+      if (this.streamingMode) {
+        const j = gltf.parser.json || {};
+        this._gltfJson = j;
+        // Compute the absolute file-offset where the BIN chunk's payload
+        // starts. extras.LOCAL_progressive byteOffsets are RELATIVE to the
+        // BIN chunk; we add this base to form absolute Range requests.
+        // GLB layout: 12-byte header + 8-byte JSON chunk header + JSON +
+        // 8-byte BIN chunk header + BIN bytes. JSON length lives at offset
+        // 12 (uint32 LE).
+        {
+          const dv = new DataView(rootBytes.buffer, rootBytes.byteOffset, rootBytes.byteLength);
+          const jsonChunkLen = dv.getUint32(12, true);
+          this._binBase = 12 + 8 + jsonChunkLen + 8;
+        }
+        // Snapshot just what we need; the parser's `json` may otherwise be
+        // mutated by extension preprocessors. Bufferviews carry byteOffsets
+        // we'll remap; accessors carry component/count/type info.
+        this._streamBufferViews = (j.bufferViews || []).map((bv) => ({
+          buffer: bv.buffer,
+          byteOffset: bv.byteOffset || 0,
+          byteLength: bv.byteLength,
+          byteStride: bv.byteStride,
+          target: bv.target,
+        }));
+        this._streamAccessors = (j.accessors || []).map((a) => ({
+          bufferView: a.bufferView,
+          byteOffset: a.byteOffset || 0,
+          componentType: a.componentType,
+          normalized: !!a.normalized,
+          count: a.count,
+          type: a.type,
+          min: a.min,
+          max: a.max,
+          sparse: a.sparse,
+        }));
+        // KHR_mesh_quantization may be needed when the meshopt'd LODs use
+        // quantized attribute component types — preserve original extension
+        // declarations.
+        this._streamExtensionsUsed = j.extensionsUsed ? [...j.extensionsUsed] : undefined;
+        this._streamExtensionsRequired = j.extensionsRequired ? [...j.extensionsRequired] : undefined;
+      }
       if (ext) {
         const kindRank = { unskinned: 0, vertcolor: 1, textured: 2 };
         for (const m of ext.meshes) {
@@ -355,6 +538,46 @@ class Asset {
     return this.pool._enqueue(`${this.url}#${key}`, async () => {
       const stillCached = this.geoCache.get(key);
       if (stillCached) return stillCached;
+      // ----- Streaming-GLB path ---------------------------------------------
+      // No sibling file: same `this.url`, fetched with a Range header that
+      // covers exactly the bufferViews this LOD owns. We synthesize a tiny
+      // standalone GLB whose JSON references those bufferViews remapped to a
+      // zero-based BIN buffer, then hand THAT to the worker (or main thread)
+      // which runs the existing GLTFLoader.parse + _bakeQuantizeDecode pipe.
+      if (this.streamingMode && (target.byteOffset != null) && (target.byteLength != null)) {
+        const spec = this._buildStreamingLodSpec(target);
+        if (this.pool._workers.length) {
+          try {
+            const payload = await this.pool._workerFetchStreamingLod(
+              this.url, target.byteOffset, target.byteLength, spec, target.decodeAABB, this._binBase || 0,
+            );
+            this.pool._trackBytes(this.url, this.url, payload.bytes);
+            const geo = ModelPool._buildGeometryFromPayload(payload);
+            this.geoCache.set(key, geo);
+            this.byteWeights.set(key, payload.bytes);
+            return geo;
+          } catch (e) {
+            console.warn('[asset] streaming worker decode failed, fallback main thread', e);
+          }
+        }
+        // Main-thread streaming fallback.
+        const slice = await this._fetchRange(this.url, target.byteOffset, target.byteLength);
+        const glb = _composeSubGLB(spec, slice);
+        const gltf = await new Promise((resolve, reject) => {
+          this._lodLoader.parse(glb.buffer, '', resolve, reject);
+        });
+        let srcMesh = null;
+        gltf.scene.updateMatrixWorld(true);
+        gltf.scene.traverse((c) => { if (c.isMesh && !srcMesh) srcMesh = c; });
+        const geo = srcMesh?.geometry;
+        if (geo) {
+          _bakeQuantizeDecode(geo, srcMesh.matrixWorld, target.decodeAABB);
+          this.geoCache.set(key, geo);
+          this.byteWeights.set(key, slice.byteLength);
+        }
+        return geo;
+      }
+      // ----- Sibling-file path (back-compat) --------------------------------
       const fullUrl = this.baseDir + target.path;
       // Worker path: fetch + parse + bake-decode all happen off-thread; we
       // get back a payload of transferable typed arrays and a small bbox
@@ -403,7 +626,13 @@ class Asset {
     return this.pool._enqueue(`${this.url}#tex:${key}`, async () => {
       const stillCached = this.texCache.get(key);
       if (stillCached) return stillCached;
-      const bytes = await this._fetchBytes(this.baseDir + target.path);
+      let bytes;
+      if (this.streamingMode && target.byteOffset != null && target.byteLength != null) {
+        bytes = await this._fetchRange(this.url, target.byteOffset, target.byteLength);
+        this.pool._trackBytes(this.url, `${this.url}#tex:${key}`, bytes.byteLength);
+      } else {
+        bytes = await this._fetchBytes(this.baseDir + target.path);
+      }
       const blob = new Blob([bytes], { type: target.mime || 'image/webp' });
       const bmp = await createImageBitmap(blob, { colorSpaceConversion: 'none' });
       this.texCache.set(key, bmp);
@@ -1140,6 +1369,20 @@ export class ModelPool extends Emitter {
     return new Promise((resolve, reject) => {
       this._workerPending.set(id, { resolve, reject });
       w.postMessage({ id, url, decodeAABB });
+    });
+  }
+
+  // Streaming variant: same worker, different message shape. Worker fetches
+  // a byte-range slice of `url`, composes a sub-GLB using `jsonSpec`, parses
+  // it, and returns the same payload shape as `_workerFetchLod`.
+  _workerFetchStreamingLod(url, byteOffset, byteLength, jsonSpec, decodeAABB, binBase) {
+    if (!this._workers.length) return null;
+    const id = ++this._workerNextId;
+    const w = this._workers[this._workerRR];
+    this._workerRR = (this._workerRR + 1) % this._workers.length;
+    return new Promise((resolve, reject) => {
+      this._workerPending.set(id, { resolve, reject });
+      w.postMessage({ id, url, streaming: true, byteOffset, byteLength, jsonSpec, decodeAABB, binBase });
     });
   }
 

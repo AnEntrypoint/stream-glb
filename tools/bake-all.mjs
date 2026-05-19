@@ -24,18 +24,27 @@ const repoRoot = path.resolve(__dirname, '..');
 const SOURCE_DIRS = process.argv.length > 2
   ? process.argv.slice(2)
   : [path.join(repoRoot, 'models')];
-const OUTPUT_BASE = path.join(repoRoot, 'examples/local-progressive');
+const OUTPUT_BASE = process.env.OUTPUT_BASE
+  ? path.resolve(process.env.OUTPUT_BASE)
+  : path.join(repoRoot, 'examples/stress/output');
 const PARALLEL = Math.max(1, parseInt(process.env.PARALLEL || '4', 10));
 const SKIP_IF_EXISTS = process.env.SKIP_EXISTING !== '0';
 
+// Directories to skip during walk: build outputs (so we don't bake bakes),
+// version-control + dependency dirs, and anything explicitly named.
+const SKIP_DIRS = new Set(['node_modules', '.git', '.gm', 'baked', 'streaming', 'dist', 'docs', 'src', 'scripts', 'converted', 'thumbs']);
 async function walk(dir, out = []) {
   let entries;
   try { entries = await readdir(dir, { withFileTypes: true }); }
   catch { return out; }
   for (const e of entries) {
-    const full = path.join(dir, e.name);
-    if (e.isDirectory()) await walk(full, out);
-    else if (e.isFile() && /\.(glb|vrm)$/i.test(e.name)) out.push(full);
+    if (e.isDirectory()) {
+      if (SKIP_DIRS.has(e.name)) continue;
+      if (e.name.startsWith('output_')) continue;
+      await walk(path.join(dir, e.name), out);
+    } else if (e.isFile() && /\.(glb|vrm)$/i.test(e.name)) {
+      out.push(path.join(dir, e.name));
+    }
   }
   return out;
 }
@@ -104,7 +113,7 @@ function runBake(inPath, outDir) {
   return new Promise((resolve, reject) => {
     const child = spawn(
       process.execPath,
-      [path.join(__dirname, 'bake-progressive.mjs'), inPath, outDir],
+      [path.join(__dirname, process.env.BAKER || 'bake-progressive.mjs'), inPath, outDir],
       { stdio: ['ignore', 'pipe', 'pipe'] }
     );
     let stderr = '';
