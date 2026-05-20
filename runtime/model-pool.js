@@ -31,6 +31,12 @@ const _tmpV3b = new THREE.Vector3();
 const _tmpSphere = new THREE.Sphere();
 const _zeroMatrix = new THREE.Matrix4().set(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
 
+// Monotonic clock for LRU touch timestamps. performance.now() in browser,
+// process.hrtime-ish fallback elsewhere — only needs to be monotonic-ish.
+const _now = (typeof performance !== 'undefined' && performance.now)
+  ? () => performance.now()
+  : () => Date.now();
+
 // --- shared GLTFLoaders ---------------------------------------------------
 // Two flavors: one with the VRM plugin (root loads), one without (sibling
 // LOD loads — the siblings carry no VRM extension blob, and the plugin's
@@ -286,6 +292,10 @@ class Asset {
     this.geoCache = new Map();
     // Cached shared texture bitmaps: key `${textureIndex}:${lodIdx}` -> ImageBitmap
     this.texCache = new Map();
+    // LRU touch timestamps (performance.now() at last cache hit/fill).
+    // Eviction in _enforceBudget walks these ASC for working-set retention.
+    this.geoTouch = new Map(); // same key as geoCache
+    this.texTouch = new Map(); // same key as texCache
     // The original gltf payload from the root load — used to clone scenes
     // per-entity. Held as the parsed three.js Object3D plus parser.json.
     this.rootGltf = null;
@@ -493,6 +503,7 @@ class Asset {
             const inlineLodIdx = desc.lods.findIndex((l) => l.inline);
             if (inlineLodIdx >= 0) {
               this.geoCache.set(`${desc.meshIndex}:${desc.primIndex}:${inlineLodIdx}`, c.geometry);
+              this.geoTouch.set(`${desc.meshIndex}:${desc.primIndex}:${inlineLodIdx}`, _now());
             }
           }
           meshIdx++;
@@ -511,6 +522,7 @@ class Asset {
             const inlineIdx = desc.lods.findIndex((l) => l.inline);
             if (inlineIdx >= 0) {
               this.texCache.set(`${desc.textureIndex}:${inlineIdx}`, tex.image);
+              this.texTouch.set(`${desc.textureIndex}:${inlineIdx}`, _now());
             }
           }
         }
@@ -532,12 +544,12 @@ class Asset {
     if (!target) return null;
     const key = `${desc.meshIndex}:${desc.primIndex}:${lodIdx}`;
     const cached = this.geoCache.get(key);
-    if (cached) return cached;
+    if (cached) { this.geoTouch.set(key, _now()); return cached; }
     if (target.inline) return null; // should already be cached from root load
     // De-dupe in-flight requests through the pool's load queue (Phase C).
     return this.pool._enqueue(`${this.url}#${key}`, async () => {
       const stillCached = this.geoCache.get(key);
-      if (stillCached) return stillCached;
+      if (stillCached) { this.geoTouch.set(key, _now()); return stillCached; }
       // ----- Streaming-GLB path ---------------------------------------------
       // No sibling file: same `this.url`, fetched with a Range header that
       // covers exactly the bufferViews this LOD owns. We synthesize a tiny
@@ -554,6 +566,7 @@ class Asset {
             this.pool._trackBytes(this.url, this.url, payload.bytes);
             const geo = ModelPool._buildGeometryFromPayload(payload);
             this.geoCache.set(key, geo);
+            this.geoTouch.set(key, _now());
             this.byteWeights.set(key, payload.bytes);
             return geo;
           } catch (e) {
@@ -573,6 +586,7 @@ class Asset {
         if (geo) {
           _bakeQuantizeDecode(geo, srcMesh.matrixWorld, target.decodeAABB);
           this.geoCache.set(key, geo);
+          this.geoTouch.set(key, _now());
           this.byteWeights.set(key, slice.byteLength);
         }
         return geo;
@@ -589,6 +603,7 @@ class Asset {
           this.pool._trackBytes(this.url, fullUrl, payload.bytes);
           const geo = ModelPool._buildGeometryFromPayload(payload);
           this.geoCache.set(key, geo);
+          this.geoTouch.set(key, _now());
           this.byteWeights.set(key, payload.bytes);
           return geo;
         } catch (e) {
@@ -608,6 +623,7 @@ class Asset {
       if (geo) {
         _bakeQuantizeDecode(geo, srcMesh.matrixWorld, target.decodeAABB);
         this.geoCache.set(key, geo);
+        this.geoTouch.set(key, _now());
         this.byteWeights.set(key, bytes.byteLength);
       }
       return geo;
@@ -621,11 +637,11 @@ class Asset {
     if (!target) return null;
     const key = `${desc.textureIndex}:${lodIdx}`;
     const cached = this.texCache.get(key);
-    if (cached) return cached;
+    if (cached) { this.texTouch.set(key, _now()); return cached; }
     if (target.inline) return null;
     return this.pool._enqueue(`${this.url}#tex:${key}`, async () => {
       const stillCached = this.texCache.get(key);
-      if (stillCached) return stillCached;
+      if (stillCached) { this.texTouch.set(key, _now()); return stillCached; }
       let bytes;
       if (this.streamingMode && target.byteOffset != null && target.byteLength != null) {
         bytes = await this._fetchRange(this.url, target.byteOffset, target.byteLength);
@@ -636,6 +652,7 @@ class Asset {
       const blob = new Blob([bytes], { type: target.mime || 'image/webp' });
       const bmp = await createImageBitmap(blob, { colorSpaceConversion: 'none' });
       this.texCache.set(key, bmp);
+      this.texTouch.set(key, _now());
       this.byteWeights.set(`tex:${key}`, bytes.byteLength);
       return bmp;
     });
@@ -652,6 +669,7 @@ class Asset {
     if (!geo) return false;
     geo.dispose();
     this.geoCache.delete(key);
+    this.geoTouch.delete(key);
     this.byteWeights.delete(key);
     return true;
   }
@@ -665,6 +683,7 @@ class Asset {
     if (!bmp) return false;
     if (bmp.close) bmp.close();
     this.texCache.delete(key);
+    this.texTouch.delete(key);
     this.byteWeights.delete(`tex:${key}`);
     return true;
   }
@@ -854,7 +873,9 @@ class Entity extends Emitter {
     // Fetch geometry (cached or on-demand).
     let geo;
     if (target.inline) {
-      geo = this.asset.geoCache.get(`${desc.meshIndex}:${desc.primIndex}:${wantIdx}`);
+      const _gk = `${desc.meshIndex}:${desc.primIndex}:${wantIdx}`;
+      geo = this.asset.geoCache.get(_gk);
+      if (geo) this.asset.geoTouch.set(_gk, _now());
     } else {
       geo = await this.asset.ensureMeshLod(tm.meshDescIdx, wantIdx);
     }
@@ -970,7 +991,9 @@ class Entity extends Emitter {
     let bmp;
     const target = desc.lods[wantIdx];
     if (target.inline) {
-      bmp = this.asset.texCache.get(`${desc.textureIndex}:${wantIdx}`);
+      const _tk = `${desc.textureIndex}:${wantIdx}`;
+      bmp = this.asset.texCache.get(_tk);
+      if (bmp) this.asset.texTouch.set(_tk, _now());
     } else {
       bmp = await this.asset.ensureTexLod(tdIdx, wantIdx);
     }
@@ -1626,49 +1649,84 @@ export class ModelPool extends Emitter {
   }
   _enforceBudget() {
     if (this._totalBytes <= this.byteBudget) return;
-    // Find evict candidates: LODs no current entity is using AND not inline.
-    // Walk every asset's cached non-inline geo/tex; drop any whose key isn't
-    // currently active on any entity.
+    // LRU eviction with hard byte budget.
+    //
+    // 1. Build inUse set of (asset|kind:descIdx:lodIdx) keys currently bound
+    //    to a live Entity's tracked mesh / texture slots.
+    // 2. Gather all evict-eligible cached entries (non-inline, not in inUse)
+    //    with their lastTouched timestamp and byte cost.
+    // 3. Sort ascending by lastTouched (oldest = first to go).
+    // 4. Evict one-by-one until under budget OR no candidates left,
+    //    emitting `budget-pressure` per eviction so callers can observe
+    //    working-set churn (not just one summary).
     const inUse = new Set();
     for (const e of this._entities) {
       for (const tm of e.trackedMeshes) {
         const d = e.asset.meshLodDescs[tm.meshDescIdx];
-        if (d) inUse.add(`${e.asset.url}|${d.meshIndex}:${d.primIndex}:${tm.currentLod}`);
+        if (d) inUse.add(`${e.asset.url}|geo|${d.meshIndex}:${d.primIndex}:${tm.currentLod}`);
         for (let ti = 0; ti < tm.texState.length; ti++) {
           const td = e.asset.texLodDescs[ti];
-          if (td) inUse.add(`${e.asset.url}|tex:${td.textureIndex}:${tm.texState[ti].currentLod}`);
+          if (td) inUse.add(`${e.asset.url}|tex|${td.textureIndex}:${tm.texState[ti].currentLod}`);
         }
       }
     }
-    let evicted = 0;
+
+    // Gather candidates. We walk descriptors (which know the inline flag and
+    // byte weight) rather than the raw cache so we never accidentally
+    // consider an inline / root-baked entry.
+    const now = _now();
+    const candidates = [];
     for (const asset of this._assets.values()) {
-      for (const desc of asset.meshLodDescs) {
+      for (let di = 0; di < asset.meshLodDescs.length; di++) {
+        const desc = asset.meshLodDescs[di];
         for (let li = 0; li < desc.lods.length; li++) {
           if (desc.lods[li].inline) continue;
-          const key = `${asset.url}|${desc.meshIndex}:${desc.primIndex}:${li}`;
-          if (!inUse.has(key)) {
-            if (asset.evictMeshLod(asset.meshLodDescs.indexOf(desc), li)) {
-              this._totalBytes -= (desc.lods[li].bytes || 0);
-              evicted++;
-            }
-          }
+          const cacheKey = `${desc.meshIndex}:${desc.primIndex}:${li}`;
+          if (!asset.geoCache.has(cacheKey)) continue; // not cached
+          const inUseKey = `${asset.url}|geo|${cacheKey}`;
+          if (inUse.has(inUseKey)) continue;
+          const lastTouched = asset.geoTouch.get(cacheKey) || 0;
+          const bytes = asset.byteWeights.get(cacheKey) || desc.lods[li].bytes || 0;
+          candidates.push({ asset, kind: 'geo', descIdx: di, lodIdx: li, cacheKey, lastTouched, bytes });
         }
       }
-      for (const desc of asset.texLodDescs) {
+      for (let di = 0; di < asset.texLodDescs.length; di++) {
+        const desc = asset.texLodDescs[di];
         for (let li = 0; li < desc.lods.length; li++) {
           if (desc.lods[li].inline) continue;
-          const key = `${asset.url}|tex:${desc.textureIndex}:${li}`;
-          if (!inUse.has(key)) {
-            if (asset.evictTexLod(asset.texLodDescs.indexOf(desc), li)) {
-              this._totalBytes -= (desc.lods[li].bytes || 0);
-              evicted++;
-            }
-          }
+          const cacheKey = `${desc.textureIndex}:${li}`;
+          if (!asset.texCache.has(cacheKey)) continue;
+          const inUseKey = `${asset.url}|tex|${cacheKey}`;
+          if (inUse.has(inUseKey)) continue;
+          const lastTouched = asset.texTouch.get(cacheKey) || 0;
+          const bytes = asset.byteWeights.get(`tex:${cacheKey}`) || desc.lods[li].bytes || 0;
+          candidates.push({ asset, kind: 'tex', descIdx: di, lodIdx: li, cacheKey, lastTouched, bytes });
         }
       }
-      if (this._totalBytes <= this.byteBudget) break;
     }
-    if (evicted) this.emit('budget-pressure', { evicted, total: this._totalBytes, budget: this.byteBudget });
+    // Oldest first.
+    candidates.sort((a, b) => a.lastTouched - b.lastTouched);
+    for (const c of candidates) {
+      if (this._totalBytes <= this.byteBudget) break;
+      const ok = c.kind === 'geo'
+        ? c.asset.evictMeshLod(c.descIdx, c.lodIdx)
+        : c.asset.evictTexLod(c.descIdx, c.lodIdx);
+      if (!ok) continue;
+      // _trackBytes uses (assetUrl, url, bytes); we never recorded a precise
+      // url here (per-LOD fetch already called _trackBytes/_untrackBytes via
+      // the fetch wrappers in some paths but not all). The byteWeights map
+      // is the authoritative size for the cached resource — subtract that.
+      this._totalBytes -= c.bytes;
+      if (this._totalBytes < 0) this._totalBytes = 0;
+      this.emit('budget-pressure', {
+        key: `${c.asset.url}|${c.kind}|${c.cacheKey}`,
+        kind: c.kind,
+        lastTouched: c.lastTouched,
+        ageMs: c.lastTouched ? (now - c.lastTouched) : null,
+        bytes: c.bytes,
+        remaining: this._totalBytes,
+      });
+    }
   }
 
   // --- Bounded concurrent fetch queue --------------------------------------

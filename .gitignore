@@ -6,3 +6,4 @@ output_*/
 .claude/
 *.log
 package-lock.json
+examples/stress/test-streaming/model.progressive.glb

@@ -560,13 +560,28 @@ async function main() {
   finalJson.buffers = [{ byteLength: binCursor }];
 
   // Decide LOWEST mesh-LOD: prefer 'unskinned' (last entry) — sorted by ratio.
-  // We emit primitive attrs pointing at the SMALLEST-ratio LOD.
+  // Vanilla-loader visible primitive: pick the highest-ratio vertex-only LOD
+  // (vertcolor or unskinned). This gives a third-party glTF loader the
+  // best-quality vertex-color shape WITHOUT needing any texture, skinning,
+  // or compression decoders. Standard loaders see one self-contained mesh.
+  // Our streaming runtime ignores this default and routes by extras.
+  const pickedDefaultLodByMesh = new Map(); // meshIndex -> kind
   for (const rec of lodMap) {
     const mesh = finalJson.meshes[rec.meshIndex];
     const prim = mesh.primitives[rec.primIndex];
-    // Pick lowest by ratio ascending — last in lods after sort.
-    const sorted = [...rec.lods].sort((a, b) => a.ratio - b.ratio);
-    const lowest = sorted[0];
+    // Prefer the highest-ratio vertex-only LOD (kind: vertcolor or unskinned).
+    // Fall back to the smallest-ratio textured LOD if no vertex-only LOD
+    // exists for this primitive.
+    const vertexOnly = rec.lods.filter((l) => l.kind === 'vertcolor' || l.kind === 'unskinned');
+    let lowest;
+    if (vertexOnly.length) {
+      vertexOnly.sort((a, b) => b.ratio - a.ratio);
+      lowest = vertexOnly[0];
+    } else {
+      const sorted = [...rec.lods].sort((a, b) => a.ratio - b.ratio);
+      lowest = sorted[0];
+    }
+    pickedDefaultLodByMesh.set(rec.meshIndex, lowest.kind);
     prim.attributes = {};
     for (const sem of Object.keys(lowest.attrAccs)) {
       prim.attributes[sem] = lowest.attrAccs[sem];
@@ -625,18 +640,12 @@ async function main() {
     delete finalJson.animations;
   }
 
-  // If the lowest mesh LOD is 'unskinned' for any primitive, nodes that
-  // reference such a mesh should NOT carry a skin reference (the primitive
-  // has no JOINTS_0/WEIGHTS_0 anymore). Walk nodes and clear skin for any
-  // node referencing a mesh whose lowest-LOD primitives are all unskinned.
+  // If the picked default LOD is 'unskinned' for a mesh, nodes referencing
+  // it should NOT carry a skin reference (the primitive has no
+  // JOINTS_0/WEIGHTS_0 in that LOD).
   if (finalJson.nodes) {
-    const meshIsLowestUnskinned = new Set();
-    for (const rec of lodMap) {
-      const sorted = [...rec.lods].sort((a, b) => a.ratio - b.ratio);
-      if (sorted[0].kind === 'unskinned') meshIsLowestUnskinned.add(rec.meshIndex);
-    }
     for (const node of finalJson.nodes) {
-      if (node.mesh != null && meshIsLowestUnskinned.has(node.mesh) && node.skin != null) {
+      if (node.mesh != null && pickedDefaultLodByMesh.get(node.mesh) === 'unskinned' && node.skin != null) {
         delete node.skin;
       }
     }

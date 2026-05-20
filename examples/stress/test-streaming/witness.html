@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>witness: bidirectional LOD on streaming GLB</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #181820; color: #eee; font: 13px/1.4 system-ui, sans-serif; overflow: hidden; }
+  #c { display: block; width: 100vw; height: 100vh; }
+  #hud { position: fixed; top: 8px; left: 8px; padding: 8px 10px; background: rgba(0,0,0,.7); border-radius: 6px; pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">init...</div>
+<script type="importmap">
+{
+  "imports": {
+    "three": "/vendor/three/build/three.module.js",
+    "three/addons/": "/vendor/three/examples/jsm/",
+    "@pixiv/three-vrm": "/vendor/three-vrm/three-vrm.module.min.js"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { ModelPool } from '/runtime/model-pool.js';
+
+const canvas = document.getElementById('c');
+const hud = document.getElementById('hud');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: false });
+renderer.setPixelRatio(1);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x181820);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x222233, 1.0));
+const dir = new THREE.DirectionalLight(0xffffff, 1.2);
+dir.position.set(2, 5, 2); scene.add(dir);
+const camera = new THREE.PerspectiveCamera(55, 1, 0.01, 1000);
+function resize() {
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+window.addEventListener('resize', resize); resize();
+
+const pool = new ModelPool({
+  scene, renderer, camera,
+  targetFps: 60,
+  byteBudget: 512 * 1024 * 1024,
+  maxConcurrentFetches: 6,
+});
+window.__pool = pool;
+
+// Single entity at origin, loaded from the streaming bake we copied into
+// /examples/stress/test-streaming/model.progressive.glb.
+const proxy = pool.spawn('/examples/stress/test-streaming/model.progressive.glb', {
+  position: [0, 0, 0],
+  rotation: [0, 0, 0],
+  static: true,
+});
+scene.add(proxy.root);
+window.__proxy = proxy;
+
+// Distance is the only input the picker reads; the witness script writes
+// window.__camDist to control the close/far phases without orbit drift.
+window.__camDist = 30;
+camera.position.set(0, 0.5, 30);
+camera.lookAt(0, 0.5, 0);
+
+function tick() {
+  const d = window.__camDist;
+  camera.position.set(0, 0.5, d);
+  camera.lookAt(0, 0.5, 0);
+  pool.update();
+  renderer.render(scene, camera);
+  const ent = proxy.actualEntity;
+  const tm = ent?.trackedMeshes?.[0];
+  hud.textContent = `dist=${d.toFixed(2)} currentLod=${tm?.currentLod ?? '?'} geoCache=${ent?.asset?.geoCache?.size ?? 0}`;
+  requestAnimationFrame(tick);
+}
+tick();
+</script>
+</body>
+</html>

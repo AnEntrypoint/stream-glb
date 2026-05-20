@@ -43,7 +43,16 @@ async function tryResolve(urlPath) {
 createServer(async (req, res) => {
   try {
     let urlPath = decodeURIComponent(req.url.split('?')[0]);
-    if (urlPath === '/' || urlPath === '') urlPath = '/examples/stress/stress.html';
+    if (urlPath === '/' || urlPath === '') {
+      // Redirect to the stress demo so relative imports in stress.html
+      // (./stress.js, ./test-streaming/...) resolve against /examples/stress/.
+      res.writeHead(302, { Location: '/examples/stress/' });
+      res.end();
+      return;
+    }
+    if (urlPath === '/examples/stress' || urlPath === '/examples/stress/') urlPath = '/examples/stress/stress.html';
+    // Auto-resolve dir/ → dir/index.html for any directory.
+    if (urlPath.endsWith('/')) urlPath += 'index.html';
     if (urlPath === '/assets-list.json') {
       const entries = await readdir(ASSETS_DIR, { withFileTypes: true });
       const dirs = entries

@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>vanilla viewer — armchair</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #181820; color: #eee; font: 13px/1.4 system-ui, sans-serif; overflow: hidden; }
+  #c { display: block; width: 100vw; height: 100vh; }
+  #hud { position: fixed; top: 8px; left: 8px; padding: 8px 10px; background: rgba(0,0,0,.7); border-radius: 6px; pointer-events: none; }
+  #hud b { color: #8df; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">loading...</div>
+<script type="importmap">
+{
+  "imports": {
+    "three": "/vendor/three/build/three.module.js",
+    "three/addons/": "/vendor/three/examples/jsm/"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const canvas = document.getElementById('c');
+const hud = document.getElementById('hud');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio || 1);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x181820);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x223344, 1.5));
+const dir = new THREE.DirectionalLight(0xffffff, 1.2);
+dir.position.set(3, 5, 2);
+scene.add(dir);
+const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 100);
+camera.position.set(1.5, 1, 1.5);
+const controls = new OrbitControls(camera, canvas);
+controls.target.set(0, 0.5, 0);
+
+function resize() {
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+window.addEventListener('resize', resize); resize();
+
+// VANILLA loader — no Meshopt, no DRACO, no KTX2 wiring.
+const loader = new GLTFLoader();
+const t0 = performance.now();
+loader.load('./model.glb', (gltf) => {
+  const dt = (performance.now() - t0).toFixed(0);
+  scene.add(gltf.scene);
+  // Auto-frame
+  const box = new THREE.Box3().setFromObject(gltf.scene);
+  const size = box.getSize(new THREE.Vector3()).length();
+  const center = box.getCenter(new THREE.Vector3());
+  controls.target.copy(center);
+  camera.position.copy(center).add(new THREE.Vector3(size, size * 0.6, size));
+  controls.update();
+  // Stats
+  let meshCount = 0, vertCount = 0, texCount = 0;
+  gltf.scene.traverse((o) => {
+    if (o.isMesh || o.isSkinnedMesh) {
+      meshCount++;
+      vertCount += o.geometry?.attributes?.position?.count || 0;
+      if (o.material) {
+        for (const slot of ['map', 'normalMap', 'roughnessMap', 'metalnessMap', 'emissiveMap']) {
+          if (o.material[slot]) texCount++;
+        }
+      }
+    }
+  });
+  hud.innerHTML = `
+    <b>vanilla GLTFLoader</b><br>
+    parse time: ${dt} ms<br>
+    meshes: ${meshCount}<br>
+    vertices: ${vertCount.toLocaleString()}<br>
+    texture refs: ${texCount}<br>
+    <small>orbit: drag · zoom: wheel</small>
+  `;
+}, undefined, (err) => {
+  hud.textContent = 'ERROR: ' + err.message;
+  console.error(err);
+});
+
+function tick() {
+  controls.update();
+  renderer.render(scene, camera);
+  requestAnimationFrame(tick);
+}
+tick();
+</script>
+</body>
+</html>
