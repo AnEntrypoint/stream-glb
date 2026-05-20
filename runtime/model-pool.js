@@ -273,6 +273,391 @@ uniform mat4 projViewMatrix;`
   material.needsUpdate = true;
 }
 
+// --- MegaAtlas: ONE InstancedMesh draws every FAR-tier entity ---------------
+// Concatenates the vertex-color geometry of every unskinned LOD across every
+// asset into a single indexed BufferGeometry, then drives it as a single
+// THREE.InstancedMesh. Each instance carries a `sliceId` and the vertex shader
+// NaN-collapses any vertex whose per-vertex `sliceId` attribute does not
+// match — so each instance effectively only rasterizes its own slice, even
+// though all instances share one geometry + one draw call.
+//
+// Bounded by:
+//   - vertexCapacity (start 100k, doubles on overflow)
+//   - indexCapacity (start 300k, doubles on overflow)
+//   - instanceCapacity (start 256, doubles on overflow)
+//
+// Each slice is registered once per (asset, meshDescIdx, lodIdx) the first
+// time an entity needs it; subsequent entities only need acquireInstance().
+class MegaAtlas {
+  constructor(pool) {
+    this.pool = pool;
+    // Slices: key `${assetUrl}|${meshDescIdx}|${lodIdx}` -> {sliceId, firstIndex, indexCount, baseVertex, vertexCount, refCount}
+    this.slices = new Map();
+    this._nextSliceId = 1; // 0 reserved for "empty slot"
+    // Vertex pool
+    this.vertexCapacity = 100000;
+    this.vertexCount = 0;
+    this._positions = new Float32Array(this.vertexCapacity * 3);
+    this._normals = new Float32Array(this.vertexCapacity * 3);
+    this._colors = new Float32Array(this.vertexCapacity * 3);
+    this._sliceIds = new Float32Array(this.vertexCapacity); // per-vertex
+    // Index pool (UInt32 — atlas may exceed 65k verts)
+    this.indexCapacity = 300000;
+    this.indexCount = 0;
+    this._indices = new Uint32Array(this.indexCapacity);
+    // Instance pool
+    this.instanceCapacity = 256;
+    this.instanceCount = 0; // high-water for mesh.count
+    this.freeInstances = [];
+    this.nextInstance = 0;
+    this.instanceSlotMap = new Map(); // tm -> instance idx
+    // Per-instance bound sphere (cx, cy, cz, r) for GPU frustum cull
+    this._boundArray = new Float32Array(this.instanceCapacity * 4);
+    // Per-instance slice id (float)
+    this._instSliceArray = new Float32Array(this.instanceCapacity);
+
+    // Build geometry
+    this.geometry = new THREE.BufferGeometry();
+    this._posAttr = new THREE.BufferAttribute(this._positions, 3);
+    this._norAttr = new THREE.BufferAttribute(this._normals, 3);
+    this._colAttr = new THREE.BufferAttribute(this._colors, 3);
+    this._sidAttr = new THREE.BufferAttribute(this._sliceIds, 1);
+    this._posAttr.setUsage(THREE.DynamicDrawUsage);
+    this._norAttr.setUsage(THREE.DynamicDrawUsage);
+    this._colAttr.setUsage(THREE.DynamicDrawUsage);
+    this._sidAttr.setUsage(THREE.DynamicDrawUsage);
+    this.geometry.setAttribute('position', this._posAttr);
+    this.geometry.setAttribute('normal', this._norAttr);
+    this.geometry.setAttribute('color', this._colAttr);
+    this.geometry.setAttribute('sliceId', this._sidAttr);
+    this._idxAttr = new THREE.BufferAttribute(this._indices, 1);
+    this._idxAttr.setUsage(THREE.DynamicDrawUsage);
+    this.geometry.setIndex(this._idxAttr);
+    this.geometry.setDrawRange(0, 0);
+    // A massive bounding sphere so three.js never frustum-culls the whole
+    // atlas at the object level — our GPU per-instance cull is what matters.
+    this.geometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1e9);
+    this.geometry.boundingBox = new THREE.Box3(
+      new THREE.Vector3(-1e9, -1e9, -1e9),
+      new THREE.Vector3(1e9, 1e9, 1e9),
+    );
+
+    // Material: vertex colors only. No texture, no fancy shading. We patch in
+    // the per-instance slice mask + frustum cull via onBeforeCompile.
+    this.material = new THREE.MeshLambertMaterial({ vertexColors: true });
+    this._uniforms = { projViewMatrix: { value: new THREE.Matrix4() } };
+    const uniforms = this._uniforms;
+    this.material.onBeforeCompile = (shader) => {
+      shader.uniforms.projViewMatrix = uniforms.projViewMatrix;
+      shader.vertexShader = shader.vertexShader
+        .replace(
+          '#include <common>',
+          `#include <common>
+attribute float sliceId;
+attribute float instanceSliceId;
+attribute vec4 instanceBoundSphere;
+uniform mat4 projViewMatrix;
+varying float vSliceReject;`
+        )
+        .replace(
+          '#include <project_vertex>',
+          `#include <project_vertex>
+{
+  // Per-vertex slice filter: NaN-collapse any vertex whose sliceId does not
+  // match this instance's instanceSliceId. The instance still iterates all
+  // indices, but each non-matching vertex degenerates the triangle.
+  if (abs(sliceId - instanceSliceId) > 0.5) {
+    gl_Position = vec4(0.0/0.0, 0.0/0.0, 0.0/0.0, 0.0/0.0) * 0.0;
+    vSliceReject = 1.0;
+  } else {
+    vSliceReject = 0.0;
+    // Per-instance frustum cull (same machinery as InstancedSlot)
+    if (instanceBoundSphere.w > 0.0) {
+      vec3 c = instanceBoundSphere.xyz;
+      float r = instanceBoundSphere.w;
+      vec4 row0 = vec4(projViewMatrix[0][0], projViewMatrix[1][0], projViewMatrix[2][0], projViewMatrix[3][0]);
+      vec4 row1 = vec4(projViewMatrix[0][1], projViewMatrix[1][1], projViewMatrix[2][1], projViewMatrix[3][1]);
+      vec4 row2 = vec4(projViewMatrix[0][2], projViewMatrix[1][2], projViewMatrix[2][2], projViewMatrix[3][2]);
+      vec4 row3 = vec4(projViewMatrix[0][3], projViewMatrix[1][3], projViewMatrix[2][3], projViewMatrix[3][3]);
+      vec4 planes[6];
+      planes[0] = row3 + row0;
+      planes[1] = row3 - row0;
+      planes[2] = row3 + row1;
+      planes[3] = row3 - row1;
+      planes[4] = row3 + row2;
+      planes[5] = row3 - row2;
+      bool outside = false;
+      for (int i = 0; i < 6; i++) {
+        vec4 p = planes[i];
+        float len = length(p.xyz);
+        if (len > 0.0) {
+          float d = (dot(p.xyz, c) + p.w) / len;
+          if (d < -r) { outside = true; break; }
+        }
+      }
+      if (outside) {
+        gl_Position = vec4(0.0/0.0, 0.0/0.0, 0.0/0.0, 0.0/0.0) * 0.0;
+      }
+    }
+  }
+}`
+        );
+      // Apply same sRGB vertex-color gamma fixup as InstancedSlot fragment.
+      shader.fragmentShader = shader.fragmentShader.replace(
+        '#include <color_fragment>',
+        `#if defined( USE_COLOR_ALPHA )
+          diffuseColor.rgb *= pow(vColor.rgb, vec3(2.2));
+          diffuseColor.a *= vColor.a;
+        #elif defined( USE_COLOR )
+          diffuseColor.rgb *= pow(vColor, vec3(2.2));
+        #endif`
+      );
+    };
+    this.material.needsUpdate = true;
+
+    // Build the InstancedMesh
+    this.mesh = new THREE.InstancedMesh(this.geometry, this.material, this.instanceCapacity);
+    this.mesh.frustumCulled = false; // GPU shader handles per-instance cull
+    this.mesh.name = '__MegaAtlas__';
+    this.mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    // Per-instance bound sphere
+    this._boundAttr = new THREE.InstancedBufferAttribute(this._boundArray, 4);
+    this._boundAttr.setUsage(THREE.DynamicDrawUsage);
+    this.mesh.geometry.setAttribute('instanceBoundSphere', this._boundAttr);
+    // Per-instance slice id
+    this._instSliceAttr = new THREE.InstancedBufferAttribute(this._instSliceArray, 1);
+    this._instSliceAttr.setUsage(THREE.DynamicDrawUsage);
+    this.mesh.geometry.setAttribute('instanceSliceId', this._instSliceAttr);
+    // Zero out matrices so unused slots collapse to origin
+    const zeroM = new THREE.Matrix4().set(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
+    for (let i = 0; i < this.instanceCapacity; i++) this.mesh.setMatrixAt(i, zeroM);
+    this.mesh.count = 0;
+    this.mesh.instanceMatrix.needsUpdate = true;
+  }
+
+  _attachToScene() {
+    if (!this._attached && this.pool.scene) {
+      this.pool.scene.add(this.mesh);
+      this._attached = true;
+    }
+  }
+
+  // Returns true if this LOD slice is eligible for the atlas. Refuses
+  // anything missing position/normal/color (we don't atlas textured LODs).
+  static isEligibleGeometry(geo) {
+    if (!geo) return false;
+    const pos = geo.getAttribute('position');
+    const col = geo.getAttribute('color');
+    if (!pos || !col) return false;
+    if (!geo.index) return false; // require indexed; the atlas works in index space
+    return true;
+  }
+
+  // Register an asset's geometry slice. Idempotent — repeat calls return the
+  // same slice record.
+  registerSlice(assetUrl, meshDescIdx, lodIdx, geo) {
+    const key = `${assetUrl}|${meshDescIdx}|${lodIdx}`;
+    const existing = this.slices.get(key);
+    if (existing) return existing;
+    if (!MegaAtlas.isEligibleGeometry(geo)) return null;
+
+    const posAttr = geo.getAttribute('position');
+    const norAttr = geo.getAttribute('normal');
+    const colAttr = geo.getAttribute('color');
+    const idxAttr = geo.index;
+    const vCount = posAttr.count;
+    const iCount = idxAttr.count;
+
+    // Grow vertex pool if needed
+    while (this.vertexCount + vCount > this.vertexCapacity) {
+      this._growVertexPool(this.vertexCapacity * 2);
+    }
+    while (this.indexCount + iCount > this.indexCapacity) {
+      this._growIndexPool(this.indexCapacity * 2);
+    }
+
+    const baseVertex = this.vertexCount;
+    const firstIndex = this.indexCount;
+    const sliceId = this._nextSliceId++;
+
+    // Copy positions/normals/colors
+    const srcPos = posAttr.array;
+    const srcNor = norAttr ? norAttr.array : null;
+    const srcCol = colAttr.array;
+    const dstP = this._positions;
+    const dstN = this._normals;
+    const dstC = this._colors;
+    const dstS = this._sliceIds;
+    for (let i = 0; i < vCount; i++) {
+      const so = i * 3;
+      const dvo = (baseVertex + i) * 3;
+      dstP[dvo] = srcPos[so];
+      dstP[dvo + 1] = srcPos[so + 1];
+      dstP[dvo + 2] = srcPos[so + 2];
+      if (srcNor) {
+        dstN[dvo] = srcNor[so];
+        dstN[dvo + 1] = srcNor[so + 1];
+        dstN[dvo + 2] = srcNor[so + 2];
+      } else {
+        dstN[dvo] = 0; dstN[dvo + 1] = 1; dstN[dvo + 2] = 0;
+      }
+      // color attribute might be itemSize 3 or 4 — handle 3 here (color-only)
+      const cItem = colAttr.itemSize || 3;
+      const cso = i * cItem;
+      dstC[dvo] = srcCol[cso];
+      dstC[dvo + 1] = srcCol[cso + 1];
+      dstC[dvo + 2] = srcCol[cso + 2];
+      dstS[baseVertex + i] = sliceId;
+    }
+
+    // Copy indices with baseVertex offset (so they reference absolute atlas vertex idx)
+    const srcIdx = idxAttr.array;
+    const dstI = this._indices;
+    for (let i = 0; i < iCount; i++) {
+      dstI[firstIndex + i] = srcIdx[i] + baseVertex;
+    }
+
+    this.vertexCount += vCount;
+    this.indexCount += iCount;
+
+    // Flag attribute updates
+    this._posAttr.needsUpdate = true;
+    this._norAttr.needsUpdate = true;
+    this._colAttr.needsUpdate = true;
+    this._sidAttr.needsUpdate = true;
+    this._idxAttr.needsUpdate = true;
+    // Update bookkeeping
+    this._posAttr.addUpdateRange(baseVertex * 3, vCount * 3);
+    this._norAttr.addUpdateRange?.(baseVertex * 3, vCount * 3);
+    this._colAttr.addUpdateRange?.(baseVertex * 3, vCount * 3);
+    this._sidAttr.addUpdateRange?.(baseVertex, vCount);
+    this._idxAttr.addUpdateRange?.(firstIndex, iCount);
+    this.geometry.setDrawRange(0, this.indexCount);
+
+    const rec = {
+      key, sliceId, firstIndex, indexCount: iCount, baseVertex, vertexCount: vCount,
+      refCount: 0,
+      // Keep a reference to the source bound sphere so acquireInstance can
+      // build the per-instance world bound from the entity transform.
+      sourceBoundingSphere: geo.boundingSphere || null,
+    };
+    this.slices.set(key, rec);
+    return rec;
+  }
+
+  _growVertexPool(newCap) {
+    const old = this.vertexCapacity;
+    const nP = new Float32Array(newCap * 3); nP.set(this._positions);
+    const nN = new Float32Array(newCap * 3); nN.set(this._normals);
+    const nC = new Float32Array(newCap * 3); nC.set(this._colors);
+    const nS = new Float32Array(newCap); nS.set(this._sliceIds);
+    this._positions = nP; this._normals = nN; this._colors = nC; this._sliceIds = nS;
+    this._posAttr = new THREE.BufferAttribute(nP, 3); this._posAttr.setUsage(THREE.DynamicDrawUsage);
+    this._norAttr = new THREE.BufferAttribute(nN, 3); this._norAttr.setUsage(THREE.DynamicDrawUsage);
+    this._colAttr = new THREE.BufferAttribute(nC, 3); this._colAttr.setUsage(THREE.DynamicDrawUsage);
+    this._sidAttr = new THREE.BufferAttribute(nS, 1); this._sidAttr.setUsage(THREE.DynamicDrawUsage);
+    this.geometry.setAttribute('position', this._posAttr);
+    this.geometry.setAttribute('normal', this._norAttr);
+    this.geometry.setAttribute('color', this._colAttr);
+    this.geometry.setAttribute('sliceId', this._sidAttr);
+    this.vertexCapacity = newCap;
+  }
+  _growIndexPool(newCap) {
+    const nI = new Uint32Array(newCap); nI.set(this._indices);
+    this._indices = nI;
+    this._idxAttr = new THREE.BufferAttribute(nI, 1);
+    this._idxAttr.setUsage(THREE.DynamicDrawUsage);
+    this.geometry.setIndex(this._idxAttr);
+    this.indexCapacity = newCap;
+  }
+  _growInstancePool(newCap) {
+    const oldMesh = this.mesh;
+    const oldBounds = this._boundArray;
+    const oldSlices = this._instSliceArray;
+    const next = new THREE.InstancedMesh(this.geometry, this.material, newCap);
+    next.frustumCulled = false;
+    next.name = '__MegaAtlas__';
+    next.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    const m = new THREE.Matrix4();
+    for (let i = 0; i < this.nextInstance; i++) {
+      oldMesh.getMatrixAt(i, m);
+      next.setMatrixAt(i, m);
+    }
+    next.count = oldMesh.count;
+    next.instanceMatrix.needsUpdate = true;
+    const nB = new Float32Array(newCap * 4); nB.set(oldBounds);
+    const nS = new Float32Array(newCap); nS.set(oldSlices);
+    this._boundArray = nB;
+    this._instSliceArray = nS;
+    this._boundAttr = new THREE.InstancedBufferAttribute(nB, 4);
+    this._boundAttr.setUsage(THREE.DynamicDrawUsage);
+    this._instSliceAttr = new THREE.InstancedBufferAttribute(nS, 1);
+    this._instSliceAttr.setUsage(THREE.DynamicDrawUsage);
+    next.geometry.setAttribute('instanceBoundSphere', this._boundAttr);
+    next.geometry.setAttribute('instanceSliceId', this._instSliceAttr);
+    const parent = oldMesh.parent;
+    if (parent) { parent.remove(oldMesh); parent.add(next); }
+    oldMesh.dispose();
+    this.mesh = next;
+    this.instanceCapacity = newCap;
+  }
+
+  // Acquire an instance slot for a given slice. Returns instance index.
+  acquireInstance(slice) {
+    let idx;
+    if (this.freeInstances.length) idx = this.freeInstances.pop();
+    else {
+      if (this.nextInstance >= this.instanceCapacity) {
+        this._growInstancePool(this.instanceCapacity * 2);
+      }
+      idx = this.nextInstance++;
+    }
+    if (idx + 1 > this.mesh.count) this.mesh.count = idx + 1;
+    this.instanceCount = Math.max(this.instanceCount, idx + 1);
+    // Set this instance's sliceId
+    this._instSliceArray[idx] = slice.sliceId;
+    this._instSliceAttr.needsUpdate = true;
+    slice.refCount++;
+    return idx;
+  }
+
+  releaseInstance(idx, slice) {
+    if (idx == null || idx < 0) return;
+    this.freeInstances.push(idx);
+    // Set sliceId to 0 (no vertex has sliceId 0 — they all start at 1) and
+    // zero out the matrix so the instance is invisible.
+    this._instSliceArray[idx] = 0;
+    this._instSliceAttr.needsUpdate = true;
+    const zero = new THREE.Matrix4().set(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
+    this.mesh.setMatrixAt(idx, zero);
+    this.mesh.instanceMatrix.needsUpdate = true;
+    const o = idx * 4;
+    this._boundArray[o] = 0; this._boundArray[o + 1] = 0; this._boundArray[o + 2] = 0; this._boundArray[o + 3] = 0;
+    this._boundAttr.needsUpdate = true;
+    if (slice) slice.refCount = Math.max(0, slice.refCount - 1);
+  }
+
+  setMatrix(idx, m) {
+    this.mesh.setMatrixAt(idx, m);
+    this.mesh.instanceMatrix.needsUpdate = true;
+  }
+  setBoundSphere(idx, cx, cy, cz, r) {
+    const o = idx * 4;
+    this._boundArray[o] = cx;
+    this._boundArray[o + 1] = cy;
+    this._boundArray[o + 2] = cz;
+    this._boundArray[o + 3] = r;
+    this._boundAttr.needsUpdate = true;
+  }
+
+  // Atlas-resident slices should be "pinned" against LRU eviction while any
+  // instance holds a ref. Used by ModelPool._enforceBudget.
+  isSlicePinned(assetUrl, meshDescIdx, lodIdx) {
+    const rec = this.slices.get(`${assetUrl}|${meshDescIdx}|${lodIdx}`);
+    return !!(rec && rec.refCount > 0);
+  }
+}
+
 // --- Asset: shared resources for one source URL ---------------------------
 // Loaded once, referenced by N Entity instances.
 class Asset {
@@ -865,7 +1250,20 @@ class Entity extends Emitter {
   // shell-type change (SkinnedMesh ↔ Mesh) and material swap as needed.
   async _applyLod(tm, wantIdx) {
     if (this._disposed) return;
-    if (wantIdx === tm.currentLod) return;
+    // Skip only if we're already AT wantIdx AND already routed correctly.
+    // The initial bootstrap leaves currentLod = inlineLodIdx but the mesh
+    // tree still owns the geometry (not routed to InstancedMesh / atlas).
+    // We have to enter the routing branch in that case to migrate it.
+    let _migrating = false;
+    if (wantIdx === tm.currentLod) {
+      const desc0 = this.asset.meshLodDescs[tm.meshDescIdx];
+      const lod0 = desc0 && desc0.lods[wantIdx];
+      const kind0 = (lod0 && lod0.kind) || 'textured';
+      const wantInstanced0 = kind0 === 'unskinned';
+      const alreadyRouted = (tm._megaInstanceIdx != null && tm._megaInstanceIdx >= 0) || !!tm._instancedSlot;
+      if (!wantInstanced0 || alreadyRouted) return;
+      _migrating = true; // suppress raced-guard so we can complete migration
+    }
     const desc = this.asset.meshLodDescs[tm.meshDescIdx];
     if (!desc) return;
     const target = desc.lods[wantIdx];
@@ -880,7 +1278,7 @@ class Entity extends Emitter {
       geo = await this.asset.ensureMeshLod(tm.meshDescIdx, wantIdx);
     }
     if (this._disposed || !geo) return;
-    if (wantIdx === tm.currentLod) return; // raced
+    if (wantIdx === tm.currentLod && !_migrating) return; // raced
     const kind = target.kind || 'textured';
     const wantSkinned = kind !== 'unskinned' && tm.baseIsSkinnedMesh;
     const haveSkinned = !!tm.mesh.isSkinnedMesh;
@@ -890,7 +1288,49 @@ class Entity extends Emitter {
     // tree. This collapses N entities into 1 draw call at the lowest LOD.
     const wantInstanced = kind === 'unskinned';
     const haveInstanced = tm._instancedSlot != null;
+    const haveMega = tm._megaInstanceIdx != null && tm._megaInstanceIdx >= 0;
     if (wantInstanced) {
+      // Prefer the MegaAtlas (one global InstancedMesh). Fall back to the
+      // per-asset InstancedSlot if the atlas refuses (multi-attr, textured-
+      // unskinned, etc.).
+      const megaSlice = this.pool._registerMegaSlice(this.asset, tm.meshDescIdx, wantIdx);
+      if (megaSlice) {
+        const atlas = this.pool._getMegaAtlas();
+        // Release any prior per-asset InstancedSlot
+        if (haveInstanced) {
+          tm._instancedSlot.releaseSlot(this);
+          tm._instancedSlot = null;
+          tm._instancedSlotIdx = -1;
+        }
+        // Release any prior mega slot only if the slice changed
+        if (haveMega && tm._megaSlice !== megaSlice) {
+          atlas.releaseInstance(tm._megaInstanceIdx, tm._megaSlice);
+          tm._megaInstanceIdx = -1;
+          tm._megaSlice = null;
+        }
+        // Hide our own mesh; instance does the drawing
+        tm.mesh.visible = false;
+        if (!haveMega || tm._megaSlice !== megaSlice) {
+          tm._megaSlice = megaSlice;
+          tm._megaInstanceIdx = atlas.acquireInstance(megaSlice);
+        }
+        // World transform + bound sphere
+        this.root.updateMatrixWorld(true);
+        atlas.setMatrix(tm._megaInstanceIdx, this.root.matrixWorld);
+        const sphere = geo.boundingSphere || megaSlice.sourceBoundingSphere;
+        if (sphere) {
+          const scale = this.root.scale.length() / Math.SQRT2;
+          const cx = this.root.matrixWorld.elements[12];
+          const cy = this.root.matrixWorld.elements[13];
+          const cz = this.root.matrixWorld.elements[14];
+          const r = sphere.radius * scale;
+          tm._instancedBoundRadius = sphere.radius;
+          atlas.setBoundSphere(tm._megaInstanceIdx, cx, cy, cz, r);
+        }
+        tm.currentLod = wantIdx;
+        this.emit('lod-changed', { entity: this, meshDescIdx: tm.meshDescIdx, lod: wantIdx, kind, instanced: true, mega: true });
+        return;
+      }
       const slot = this.pool._getInstancedSlot(this.asset, tm.meshDescIdx, wantIdx);
       if (slot) {
         // Hide the entity's own mesh from the renderer.
@@ -931,6 +1371,13 @@ class Entity extends Emitter {
       tm._instancedSlot.releaseSlot(this);
       tm._instancedSlot = null;
       tm._instancedSlotIdx = -1;
+      tm.mesh.visible = true;
+    } else if (haveMega) {
+      // Leaving the mega-atlas tier — release the atlas instance.
+      const atlas = this.pool._getMegaAtlas();
+      if (atlas) atlas.releaseInstance(tm._megaInstanceIdx, tm._megaSlice);
+      tm._megaInstanceIdx = -1;
+      tm._megaSlice = null;
       tm.mesh.visible = true;
     }
     // Material selection per kind.
@@ -1022,7 +1469,7 @@ class Entity extends Emitter {
     if (this._detached || this._disposed) return;
     if (!this.trackedMeshes.length) return;
     for (const tm of this.trackedMeshes) {
-      if (!tm._instancedSlot) return; // at least one mesh still needs per-entity draw
+      if (!tm._instancedSlot && (tm._megaInstanceIdx == null || tm._megaInstanceIdx < 0)) return; // at least one mesh still needs per-entity draw
     }
     const parent = this.root.parent;
     if (!parent) return;
@@ -1035,7 +1482,8 @@ class Entity extends Emitter {
     // Re-attach as soon as ANY tracked mesh leaves the instanced tier.
     let allInstanced = true;
     for (const tm of this.trackedMeshes) {
-      if (!tm._instancedSlot) { allInstanced = false; break; }
+      const inMega = tm._megaInstanceIdx != null && tm._megaInstanceIdx >= 0;
+      if (!tm._instancedSlot && !inMega) { allInstanced = false; break; }
     }
     if (allInstanced) return;
     if (this._sceneParent) {
@@ -1099,6 +1547,10 @@ class Entity extends Emitter {
         if (tm._instancedSlot && tm._instancedSlotIdx >= 0) {
           tm._instancedSlot.setMatrixForSlot(tm._instancedSlotIdx, this.root.matrixWorld);
         }
+        if (tm._megaInstanceIdx != null && tm._megaInstanceIdx >= 0) {
+          const atlas = this.pool._getMegaAtlas();
+          if (atlas) atlas.setMatrix(tm._megaInstanceIdx, this.root.matrixWorld);
+        }
       }
       this._maybeReattach();
       this._maybeDetach();
@@ -1120,7 +1572,15 @@ class Entity extends Emitter {
           const desc = this.asset.meshLodDescs[tm.meshDescIdx];
           if (!desc) continue;
           const targetIdx = _pickMeshLod(desc.lods, screenPx, globalCeilingLod);
-          if (targetIdx !== tm.currentLod) this._applyLod(tm, targetIdx);
+          // Always re-invoke when the picked LOD is unskinned AND the entity
+          // is not yet routed through the atlas / per-asset InstancedSlot.
+          // The migration step needs geo cached (a later frame after fetch).
+          const pickedLod = desc.lods[targetIdx];
+          const pickedKind = pickedLod && (pickedLod.kind || 'textured');
+          const needsInstancedMigration = pickedKind === 'unskinned'
+            && !(tm._megaInstanceIdx != null && tm._megaInstanceIdx >= 0)
+            && !tm._instancedSlot;
+          if (targetIdx !== tm.currentLod || needsInstancedMigration) this._applyLod(tm, targetIdx);
           for (let ti = 0; ti < tm.texState.length; ti++) {
             const tDesc = this.asset.texLodDescs[ti];
             if (!tDesc) continue;
@@ -1147,6 +1607,17 @@ class Entity extends Emitter {
           );
         }
       }
+      if (tm._megaInstanceIdx != null && tm._megaInstanceIdx >= 0) {
+        const atlas = this.pool._getMegaAtlas();
+        if (atlas) {
+          atlas.setMatrix(tm._megaInstanceIdx, this.root.matrixWorld);
+          if (movable && tm._instancedBoundRadius != null) {
+            const me = this.root.matrixWorld.elements;
+            const scale = this.root.scale.length() / Math.SQRT2;
+            atlas.setBoundSphere(tm._megaInstanceIdx, me[12], me[13], me[14], tm._instancedBoundRadius * scale);
+          }
+        }
+      }
     }
     this._boundDirty = false;
     // If every tracked mesh is now instanced, detach root from the scene
@@ -1156,7 +1627,7 @@ class Entity extends Emitter {
     this._maybeDetach();
     // Animation throttle: at distance, run mixer at reduced rate. Skip
     // entirely when the entity is instanced (bind pose only).
-    const anyInstanced = this.trackedMeshes.some((tm) => !!tm._instancedSlot);
+    const anyInstanced = this.trackedMeshes.some((tm) => !!tm._instancedSlot || (tm._megaInstanceIdx != null && tm._megaInstanceIdx >= 0));
     if (this.animationMixer && !anyInstanced) {
       if (dist > animationThrottleDistance) {
         if ((this._animTickCounter = ((this._animTickCounter || 0) + 1)) % 3 === 0) {
@@ -1186,6 +1657,10 @@ class Entity extends Emitter {
     // Release any instanced-mesh slots we held.
     for (const tm of this.trackedMeshes) {
       if (tm._instancedSlot) tm._instancedSlot.releaseSlot(this);
+      if (tm._megaInstanceIdx != null && tm._megaInstanceIdx >= 0) {
+        const atlas = this.pool._megaAtlas;
+        if (atlas) atlas.releaseInstance(tm._megaInstanceIdx, tm._megaSlice);
+      }
       if (tm.vcMaterial) tm.vcMaterial.dispose();
     }
     this.trackedMeshes = [];
@@ -1290,6 +1765,17 @@ function _findMaterialSlots(mat, texEntry) {
 }
 
 // --- ModelPool: the public facade -----------------------------------------
+//
+// Events emitted by ModelPool (in addition to per-entity forwarded events):
+//   'fps'            - per-frame stats snapshot.
+//   'budget-adjust'  - legacy adaptive-knob nudge (kept for back-compat).
+//   'budget-pressure'- per LRU eviction during _enforceBudget().
+//   'lod-pressure'   - FPS-driven ceiling change. Payload:
+//                        { ema, ceiling, direction: 'down'|'up'|'hold', reason }
+//   'vram-pressure'  - VRAM/byte-budget driven adjustment. Payload:
+//                        { reason, byteBudget, prevBudget, safetyMode, heap? }
+//   'fps' stats snapshot also includes `fpsPressure` (last direction) and
+//   `vramSafetyMode` (bool) for HUD consumption.
 export class ModelPool extends Emitter {
   constructor(opts = {}) {
     super();
@@ -1311,12 +1797,47 @@ export class ModelPool extends Emitter {
     this._fpsEma = 60;
     this._lastTick = performance.now();
     this._currentCeilingLod = null; // null = unrestricted
+    // --- FPS-driven adaptive LOD ceiling state -----------------------------
+    // Max LOD index. The picker has 5 screen-px thresholds, so indices 0..5
+    // are valid (0 = lowest detail, 5 = highest). `null` ceiling = no clamp.
+    this._maxLod = opts.maxLod ?? 5;
+    this.targetFpsMin = opts.targetFpsMin ?? (this.targetFps - 5);
+    this.targetFpsMax = opts.targetFpsMax ?? (this.targetFps + 5);
+    this._fpsBelowFrames = 0;     // consecutive frames ema < targetFpsMin
+    this._fpsAboveFrames = 0;     // consecutive frames ema > targetFpsMax
+    this._fpsDropAfter = opts.fpsDropAfter ?? 15;  // responsive drop
+    this._fpsRaiseAfter = opts.fpsRaiseAfter ?? 60; // conservative raise
+    this._lastFpsPressureDir = 'hold';
+    // --- VRAM-driven adaptive byte-budget state ----------------------------
+    // Initial budget honours caller; ceiling is whatever they passed in.
+    // If they didn't pass byteBudget, derive a tier from deviceMemory.
+    this._byteBudgetCeiling = this.byteBudget;
+    if (opts.byteBudget == null && typeof navigator !== 'undefined' && navigator.deviceMemory) {
+      // deviceMemory is RAM tier in GB (1,2,4,8). Use 12.5%, cap 256MB.
+      const tier = navigator.deviceMemory * 1024 * 1024 * 1024 * 0.125;
+      this.byteBudget = Math.min(256 * 1024 * 1024, tier);
+      this._byteBudgetCeiling = Math.min(256 * 1024 * 1024, tier);
+    }
+    this._vramSafetyMode = false;
+    this._vramAdjustCountdown = 60;
+    this._vramLastPressureFrame = 0;
+    this._vramFrameCount = 0;
+    this._vramContextLostHandler = null;
+    this._installContextLostListener();
     this._frustum = new THREE.Frustum();
     this._tmpMatrix = new THREE.Matrix4();
     // Stats snapshot — refreshed each tick, exposed via getStats().
     this._stats = { fps: 0, entities: 0, drawCalls: 0, ceilingLod: null, bytes: 0, assets: 0, inFlight: 0, hero: 0, mid: 0, far: 0 };
     // Shared InstancedMesh slots: key `${assetUrl}|${meshDescIdx}|${lodIdx}` -> InstancedSlot.
+    // Kept as a fallback for multi-mesh / textured-unskinned LODs that the
+    // MegaAtlas refuses. With the atlas in place, the typical scene routes
+    // all vertex-color unskinned LODs through ONE InstancedMesh — the
+    // _instancedSlots Map stays mostly empty.
     this._instancedSlots = new Map();
+    // Global single-InstancedMesh atlas for vertex-color unskinned LODs.
+    // Created lazily on first use so scene/renderer are guaranteed set.
+    this._megaAtlas = null;
+    this.useMegaAtlas = opts.useMegaAtlas !== false; // default on
     // Tier thresholds (in screen pixels of the entity's bounding sphere).
     // The three tiers are entirely a function of which LOD the picker
     // selects, NOT a separate routing layer:
@@ -1436,6 +1957,31 @@ export class ModelPool extends Emitter {
     return geo;
   }
 
+  // Lazily initialize and return the single MegaAtlas.
+  _getMegaAtlas() {
+    if (!this.useMegaAtlas) return null;
+    if (!this._megaAtlas) {
+      this._megaAtlas = new MegaAtlas(this);
+      if (this.scene) this._megaAtlas._attachToScene();
+    }
+    return this._megaAtlas;
+  }
+
+  // Register an unskinned-LOD geometry slice into the MegaAtlas. Returns the
+  // slice record (with sliceId/firstIndex/baseVertex) or null if ineligible.
+  _registerMegaSlice(asset, meshDescIdx, lodIdx) {
+    const atlas = this._getMegaAtlas();
+    if (!atlas) return null;
+    const desc = asset.meshLodDescs[meshDescIdx];
+    if (!desc) return null;
+    const lod = desc.lods[lodIdx];
+    if (!lod || (lod.kind || 'textured') !== 'unskinned') return null;
+    const geo = asset.geoCache.get(`${desc.meshIndex}:${desc.primIndex}:${lodIdx}`);
+    if (!geo) return null;
+    if (!MegaAtlas.isEligibleGeometry(geo)) return null;
+    return atlas.registerSlice(asset.url, meshDescIdx, lodIdx, geo);
+  }
+
   // Get-or-create an InstancedSlot for an (asset, meshDescIdx, lod) tuple.
   // Returns null if the LOD isn't suitable for instancing (currently only
   // 'unskinned' LODs qualify — they have no per-instance bone state).
@@ -1530,54 +2076,14 @@ export class ModelPool extends Emitter {
     // EMA FPS over ~1s.
     const instFps = dt > 0 ? 1 / dt : 60;
     this._fpsEma = this._fpsEma * 0.95 + instFps * 0.05;
-    // Adaptive ceiling: every 30 frames roughly, if FPS far below target
-    // lower ceiling by 1; if comfortably above, raise it by 1.
-    if (!this._fpsAdjustCountdown) this._fpsAdjustCountdown = 30;
-    this._fpsAdjustCountdown--;
-    if (this._fpsAdjustCountdown <= 0) {
-      this._fpsAdjustCountdown = 30;
-      const target = this.targetFps;
-      if (this._fpsEma < target - 5) {
-        // Multi-knob pressure response:
-        //  1. Drop LOD ceiling first.
-        //  2. If still under target, shrink midPx (push more entities to FAR
-        //     impostor tier).
-        //  3. If still under target, reduce heroCap (smaller hero count).
-        let changed = false;
-        const nextCeil = (this._currentCeilingLod ?? 5) - 1;
-        if (nextCeil >= 0 && this._currentCeilingLod !== nextCeil) {
-          this._currentCeilingLod = nextCeil;
-          changed = true;
-        } else if (this.midPx < 200) {
-          // Expand FAR range — more entities collapse to unskinned tier.
-          this.midPx = Math.min(200, this.midPx + 20);
-          changed = true;
-        } else if (this.heroCap > 5) {
-          this.heroCap = Math.max(5, this.heroCap - 5);
-          changed = true;
-        }
-        if (changed) this.emit('budget-adjust', {
-          ceiling: this._currentCeilingLod, midPx: this.midPx, heroCap: this.heroCap, fps: this._fpsEma,
-        });
-      } else if (this._fpsEma > target + 5) {
-        // Headroom — relax knobs in reverse priority.
-        let changed = false;
-        if (this.heroCap < 20) {
-          this.heroCap = Math.min(20, this.heroCap + 5);
-          changed = true;
-        } else if (this.midPx > 30) {
-          this.midPx = Math.max(30, this.midPx - 10);
-          changed = true;
-        } else if (this._currentCeilingLod != null) {
-          const next = this._currentCeilingLod + 1;
-          if (next >= 5) this._currentCeilingLod = null;
-          else this._currentCeilingLod = next;
-          changed = true;
-        }
-        if (changed) this.emit('budget-adjust', {
-          ceiling: this._currentCeilingLod, midPx: this.midPx, heroCap: this.heroCap, fps: this._fpsEma,
-        });
-      }
+    // Adaptive controllers: FPS-driven LOD ceiling (per frame, hysteresis
+    // gated) + VRAM-driven byte budget (every 60 frames).
+    this._adjustForFps();
+    this._vramFrameCount++;
+    this._vramAdjustCountdown--;
+    if (this._vramAdjustCountdown <= 0) {
+      this._vramAdjustCountdown = 60;
+      this._adjustForVram();
     }
     // Build frustum once per frame.
     const tFrustum0 = performance.now();
@@ -1588,6 +2094,9 @@ export class ModelPool extends Emitter {
     // can run the per-instance frustum cull pass.
     for (const slot of this._instancedSlots.values()) {
       slot._uniforms.projViewMatrix.value.copy(this._tmpMatrix);
+    }
+    if (this._megaAtlas) {
+      this._megaAtlas._uniforms.projViewMatrix.value.copy(this._tmpMatrix);
     }
     const vh = this.renderer.domElement.clientHeight;
     const tFrustum1 = performance.now();
@@ -1623,11 +2132,142 @@ export class ModelPool extends Emitter {
     this._stats.visible = visible;
     this._stats.drawCalls = this.renderer.info?.render?.calls ?? 0;
     this._stats.ceilingLod = this._currentCeilingLod;
+    this._stats.fpsPressure = this._lastFpsPressureDir;
+    this._stats.vramSafetyMode = this._vramSafetyMode;
     this._stats.bytes = this._totalBytes;
     this._stats.assets = this._assets.size;
     this._stats.inFlight = this._inFlight;
     this._stats.msTotal = performance.now() - tUpdate0;
     this.emit('fps', this._stats);
+  }
+
+  // --- Adaptive controllers ------------------------------------------------
+  // FPS-driven LOD ceiling with hysteresis. Drops the global ceiling when
+  // ema < targetFpsMin for `_fpsDropAfter` consecutive frames (responsive);
+  // raises when ema > targetFpsMax for `_fpsRaiseAfter` frames (conservative).
+  // Falls back to the secondary knobs (midPx / heroCap) once the ceiling is
+  // pinned at 0 (or null on the upswing).
+  _adjustForFps() {
+    // Keep min/max coherent with targetFps if caller mutated it on the fly.
+    const min = (this.targetFpsMin != null) ? this.targetFpsMin : (this.targetFps - 5);
+    const max = (this.targetFpsMax != null) ? this.targetFpsMax : (this.targetFps + 5);
+    const ema = this._fpsEma;
+    let dir = 'hold';
+    if (ema < min) {
+      this._fpsBelowFrames++;
+      this._fpsAboveFrames = 0;
+      if (this._fpsBelowFrames >= this._fpsDropAfter) {
+        this._fpsBelowFrames = 0;
+        // Drop ceiling first; if already at 0, lean on midPx/heroCap.
+        const cur = (this._currentCeilingLod ?? this._maxLod);
+        if (cur > 0) {
+          this._currentCeilingLod = cur - 1;
+          dir = 'down';
+        } else if (this.midPx < 200) {
+          this.midPx = Math.min(200, this.midPx + 20);
+          dir = 'down';
+        } else if (this.heroCap > 5) {
+          this.heroCap = Math.max(5, this.heroCap - 5);
+          dir = 'down';
+        }
+      }
+    } else if (ema > max) {
+      this._fpsAboveFrames++;
+      this._fpsBelowFrames = 0;
+      if (this._fpsAboveFrames >= this._fpsRaiseAfter) {
+        this._fpsAboveFrames = 0;
+        // Relax knobs in reverse priority: heroCap, midPx, then ceiling up.
+        if (this.heroCap < 20) {
+          this.heroCap = Math.min(20, this.heroCap + 5);
+          dir = 'up';
+        } else if (this.midPx > 30) {
+          this.midPx = Math.max(30, this.midPx - 10);
+          dir = 'up';
+        } else if (this._currentCeilingLod != null) {
+          const next = this._currentCeilingLod + 1;
+          if (next >= this._maxLod) this._currentCeilingLod = null;
+          else this._currentCeilingLod = next;
+          dir = 'up';
+        }
+      }
+    } else {
+      // In hysteresis band — decay counters slowly.
+      this._fpsBelowFrames = Math.max(0, this._fpsBelowFrames - 1);
+      this._fpsAboveFrames = Math.max(0, this._fpsAboveFrames - 1);
+    }
+    if (dir !== 'hold') {
+      this._lastFpsPressureDir = dir;
+      const payload = { ema, ceiling: this._currentCeilingLod, direction: dir,
+        midPx: this.midPx, heroCap: this.heroCap };
+      this.emit('fps-pressure', payload);
+      this.emit('lod-pressure', payload);
+      // Back-compat:
+      this.emit('budget-adjust', {
+        ceiling: this._currentCeilingLod, midPx: this.midPx, heroCap: this.heroCap, fps: ema,
+      });
+    }
+  }
+
+  // VRAM-driven byte budget. No portable WebGL VRAM query exists; we use:
+  //   1. JS heap proxy (performance.memory) — shrink 25% if >80% of limit.
+  //   2. webglcontextlost — halve budget permanently, enter safety mode.
+  //   3. Grow back toward _byteBudgetCeiling if no pressure for 60s.
+  _adjustForVram() {
+    const now = this._vramFrameCount;
+    let changed = false;
+    let reason = null;
+    const prev = this.byteBudget;
+    // 1. JS heap proxy (Chromium only).
+    let heap = null;
+    if (typeof performance !== 'undefined' && performance.memory) {
+      const m = performance.memory;
+      heap = { used: m.usedJSHeapSize, limit: m.jsHeapSizeLimit };
+      if (m.jsHeapSizeLimit > 0 && m.usedJSHeapSize / m.jsHeapSizeLimit > 0.8) {
+        const next = Math.max(16 * 1024 * 1024, Math.floor(this.byteBudget * 0.75));
+        if (next < this.byteBudget) {
+          this.byteBudget = next;
+          this._vramLastPressureFrame = now;
+          changed = true;
+          reason = 'js-heap-pressure';
+        }
+      }
+    }
+    // 3. Grow back if no pressure for ~60s (assuming ~60fps -> ~3600 frames).
+    if (!changed && !this._vramSafetyMode &&
+        this.byteBudget < this._byteBudgetCeiling &&
+        (now - this._vramLastPressureFrame) > 3600) {
+      const next = Math.min(this._byteBudgetCeiling, Math.floor(this.byteBudget * 1.1));
+      if (next > this.byteBudget) {
+        this.byteBudget = next;
+        changed = true;
+        reason = 'recovery';
+      }
+    }
+    if (changed) {
+      this.emit('vram-pressure', {
+        reason, byteBudget: this.byteBudget, prevBudget: prev,
+        safetyMode: this._vramSafetyMode, heap,
+      });
+    }
+  }
+
+  // Install webglcontextlost listener — halves byteBudget permanently
+  // (entering safetyMode) and emits a vram-pressure event. We use addEventListener
+  // and stash the handler so dispose() can detach it.
+  _installContextLostListener() {
+    if (!this.renderer || !this.renderer.domElement || typeof this.renderer.domElement.addEventListener !== 'function') return;
+    this._vramContextLostHandler = (ev) => {
+      const prev = this.byteBudget;
+      this.byteBudget = Math.max(16 * 1024 * 1024, Math.floor(this.byteBudget / 2));
+      this._byteBudgetCeiling = this.byteBudget; // permanent: cap can't recover above this
+      this._vramSafetyMode = true;
+      this._vramLastPressureFrame = this._vramFrameCount;
+      this.emit('vram-pressure', {
+        reason: 'webglcontextlost', byteBudget: this.byteBudget, prevBudget: prev,
+        safetyMode: true,
+      });
+    };
+    this.renderer.domElement.addEventListener('webglcontextlost', this._vramContextLostHandler);
   }
 
   // Public stats accessor (cheap, no allocation).

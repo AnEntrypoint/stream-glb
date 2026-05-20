@@ -50,6 +50,7 @@
     "@gltf-transform/core": "^4.3.0",
     "@gltf-transform/extensions": "^4.3.0",
     "@gltf-transform/functions": "^4.3.0",
+    "ktx2-encoder": "^0.5.3",
     "meshoptimizer": "^1.1.1",
     "sharp": "^0.34.5",
     "three": ">= 0.170.0"
