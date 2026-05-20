@@ -45,6 +45,15 @@ const EXTRA_LOD_STAGES = [
 const MAX_TEX_SIZE = parseInt(process.env.MAX_TEX_SIZE || '2048', 10);
 const TEX_LOD_SIZES = [2048, 1024, 512, 256].filter((s) => s <= MAX_TEX_SIZE);
 
+// Opt-in KTX2/Basis Universal variants alongside the webp pyramid.
+// Enable with KTX2=1. When enabled, an additional `image/ktx2` LOD is emitted
+// per webp LOD (same width) so a KTX2-aware runtime can upgrade to a GPU-
+// compressed texture. The default-scene image always points at the smallest
+// webp LOD so vanilla GLTFLoaders are unaffected.
+const KTX2_ENABLED = process.env.KTX2 === '1' || process.env.KTX2 === 'true';
+// UASTC LDR quality level 0..3. Higher = better quality, larger output.
+const KTX2_QUALITY = parseInt(process.env.KTX2_QUALITY || '2', 10);
+
 // ---------- sRGB conversion + vertex-color baking (copied from bake-progressive) ----------
 const SRGB_TO_LINEAR = new Float32Array(256);
 const LINEAR_TO_SRGB_LUT = new Uint8Array(4096);
@@ -411,9 +420,44 @@ async function main() {
     }
   }
 
-  // ---------------- Step 2: bake texture LOD bytes (webp pyramid) ----------------
-  const perTexLODs = [];
+  // ---------------- Step 2: bake texture LOD bytes (webp pyramid + optional KTX2) ----------------
+  // Optional KTX2 encoder. Loaded lazily so the default path has zero new
+  // dependencies on the existing 934-bake pipeline.
+  let ktx2Encode = null;
+  if (KTX2_ENABLED) {
+    try {
+      const mod = await import('ktx2-encoder');
+      ktx2Encode = mod.encodeToKTX2;
+      console.log(`[bake-streaming] KTX2 enabled (uastcLDRQualityLevel=${KTX2_QUALITY})`);
+    } catch (e) {
+      console.warn(`[bake-streaming] KTX2=1 but ktx2-encoder is not installed (${e.message}). Continuing with webp only.`);
+      console.warn(`[bake-streaming] Install with: npm i -D ktx2-encoder`);
+    }
+  }
+  const ktx2ImageDecoder = ktx2Encode
+    ? async (buf) => {
+        const { data, info } = await sharp(Buffer.from(buf))
+          .ensureAlpha()
+          .raw()
+          .toBuffer({ resolveWithObject: true });
+        return { width: info.width, height: info.height, data: new Uint8Array(data) };
+      }
+    : null;
+
+  // Per-texture color-space heuristic for KTX2: normal maps should NOT use
+  // sRGB transfer / perceptual mode. Detect by material slot at the texture
+  // level (look at every primitive that references this texture).
   const textures = sourceRoot.listTextures();
+  const texIsNormalMap = new Array(textures.length).fill(false);
+  for (const mat of sourceRoot.listMaterials()) {
+    const nt = mat.getNormalTexture?.();
+    if (nt) {
+      const idx = textures.indexOf(nt);
+      if (idx >= 0) texIsNormalMap[idx] = true;
+    }
+  }
+
+  const perTexLODs = [];
   for (let ti = 0; ti < textures.length; ti++) {
     const tex = textures[ti];
     const name = tex.getName() || `tex_${ti}`;
@@ -422,16 +466,48 @@ async function main() {
     const meta = await sharp(Buffer.from(img)).metadata();
     const sizes = TEX_LOD_SIZES.filter((s) => s <= Math.max(meta.width, meta.height));
     if (sizes.length === 0) sizes.push(Math.max(meta.width, meta.height));
+    const isNormal = texIsNormalMap[ti];
     const lods = [];
     for (const sz of sizes) {
-      const buf = await sharp(Buffer.from(img))
+      // 1) webp variant — always emitted.
+      const webpBuf = await sharp(Buffer.from(img))
         .resize(sz, sz, { fit: 'inside', withoutEnlargement: true })
         .webp({ quality: 82 })
         .toBuffer();
-      lods.push({ width: sz, bytes: new Uint8Array(buf), mime: 'image/webp' });
+      lods.push({ width: sz, bytes: new Uint8Array(webpBuf), mime: 'image/webp' });
+
+      // 2) ktx2 variant — only when encoder is available.
+      if (ktx2Encode) {
+        // Resize first via sharp, then re-encode as PNG so the KTX2 encoder
+        // can decode it back to RGBA via the imageDecoder callback. (The
+        // encoder accepts PNG or raw RGBA on its input side; PNG keeps the
+        // I/O contract simple.)
+        const pngBuf = await sharp(Buffer.from(img))
+          .resize(sz, sz, { fit: 'inside', withoutEnlargement: true })
+          .png()
+          .toBuffer();
+        try {
+          const ktx2Buf = await ktx2Encode(new Uint8Array(pngBuf), {
+            isUASTC: true,
+            isKTX2File: true,
+            uastcLDRQualityLevel: Math.max(0, Math.min(3, KTX2_QUALITY)),
+            isPerceptual: !isNormal,
+            isSetKTX2SRGBTransferFunc: !isNormal,
+            isNormalMap: isNormal,
+            generateMipmap: false,
+            needSupercompression: false,
+            imageDecoder: ktx2ImageDecoder,
+          });
+          lods.push({ width: sz, bytes: new Uint8Array(ktx2Buf), mime: 'image/ktx2' });
+        } catch (e) {
+          console.warn(`[bake-streaming] tex ${ti} ${sz}px KTX2 encode failed: ${e.message}`);
+        }
+      }
     }
     perTexLODs.push({ textureIndex: ti, name, lods });
-    console.log(`[bake-streaming] tex ${ti} (${name}): ${lods.length} sizes`);
+    const webpCount = lods.filter((l) => l.mime === 'image/webp').length;
+    const ktx2Count = lods.filter((l) => l.mime === 'image/ktx2').length;
+    console.log(`[bake-streaming] tex ${ti} (${name})${isNormal ? ' [normal]' : ''}: ${webpCount} webp + ${ktx2Count} ktx2`);
   }
 
   // ---------------- Step 3: build final GLB ----------------
@@ -602,9 +678,14 @@ async function main() {
     }
   }
 
-  // Images: one per texture, pointing at the SMALLEST webp LOD.
+  // Images: one per texture, pointing at the SMALLEST webp LOD. We
+  // explicitly pick webp (not ktx2) so vanilla GLTFLoaders without a KTX2
+  // decoder can still parse and display the default texture.
   finalJson.images = texMap.map((tx) => {
-    const smallest = tx.lods[tx.lods.length - 1];
+    const webpLods = tx.lods.filter((l) => l.mime === 'image/webp');
+    const smallest = (webpLods.length ? webpLods : tx.lods)
+      .slice()
+      .sort((a, b) => a.width - b.width)[0];
     return { bufferView: smallest.bufferView, mimeType: smallest.mime, name: tx.name };
   });
   finalJson.textures = (finalJson.textures || []).map((t, i) => ({ ...t, source: i }));

@@ -145,10 +145,10 @@ function tick() {
   renderer.render(scene, camera);
   const s = pool.getStats();
   hud.innerHTML = `
-    <b>FPS</b> ${s.fps.toFixed(1)} (target ${pool.targetFps})<br>
+    <b>FPS</b> ${s.fps.toFixed(1)} (target ${pool.targetFps}) <b>pressure</b> ${s.fpsPressure||'hold'}<br>
     <b>entities</b> ${s.entities} <span class="tier">HERO ${s.hero||0} MID ${s.mid||0} FAR ${s.far||0}</span><br>
     <b>draws</b> ${s.drawCalls} <b>ceiling</b> ${s.ceilingLod ?? 'auto'} <b>midPx</b> ${pool.midPx.toFixed(0)} <b>heroCap</b> ${pool.heroCap}<br>
-    <b>bytes</b> ${(s.bytes/1024/1024).toFixed(1)}/${(pool.byteBudget/1024/1024).toFixed(0)} MB
+    <b>bytes</b> ${(s.bytes/1024/1024).toFixed(1)}/${(pool.byteBudget/1024/1024).toFixed(0)} MB${s.vramSafetyMode?' <b style="color:#f55">VRAM-SAFETY</b>':''}
     <b>assets</b> ${s.assets} <b>inFlight</b> ${s.inFlight}<br>
     <b>tri</b> ${(renderer.info.render.triangles/1000).toFixed(1)}k<br>
     <b>pool.update</b> ${(s.msTotal||0).toFixed(2)}ms (frustum ${(s.msFrustum||0).toFixed(2)} entities ${(s.msEntities||0).toFixed(2)})

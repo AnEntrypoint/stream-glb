@@ -7,3 +7,4 @@ output_*/
 *.log
 package-lock.json
 examples/stress/test-streaming/model.progressive.glb
+config.bat
