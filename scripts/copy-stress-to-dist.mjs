@@ -27,6 +27,15 @@ await mkdir(path.join(dist, 'runtime'), { recursive: true });
 await cp(path.join(repoRoot, 'runtime/model-pool.js'), path.join(dist, 'runtime/model-pool.js'));
 await cp(path.join(repoRoot, 'runtime/lod-worker.js'), path.join(dist, 'runtime/lod-worker.js'));
 
+// Vendor: three.js + GLTFLoader + meshopt + three-vrm + anentrypoint-design.
+// These live at /vendor/ locally (served by examples/stress/serve.mjs which
+// serves the repo root) and at /stream-glb/vendor/ on GH Pages. The lod-worker
+// resolves them via `new URL('../vendor/...', import.meta.url)` which works
+// in both locations because it's relative to the worker URL. stress.html
+// uses absolute `/vendor/...` in source; we rewrite to `../vendor/...` for
+// dist so the deployed importmap works under /stream-glb/.
+await cp(path.join(repoRoot, 'vendor'), path.join(dist, 'vendor'), { recursive: true });
+
 // stress.js source-of-truth uses `from '/runtime/model-pool.js'` — on
 // GH Pages under /stream-glb/stress/ that absolute path is wrong; rewrite
 // to a relative path in the deployed copy. The runtime layout under
@@ -41,4 +50,12 @@ stressJs = stressJs.replace(
 );
 await writeFile(path.join(dist, 'stress/stress.js'), stressJs);
 
-console.log('[copy-stress] dist/stress/ ready');
+// Rewrite the importmap in dist/stress/index.html: source uses absolute
+// `/vendor/...` (valid under local serve.mjs which serves the repo root),
+// dist needs `../vendor/...` so GH Pages resolves it relative to
+// /stream-glb/stress/index.html → /stream-glb/vendor/...
+let stressHtml = await readFile(path.join(dist, 'stress/index.html'), 'utf8');
+stressHtml = stressHtml.replace(/"\/vendor\//g, '"../vendor/');
+await writeFile(path.join(dist, 'stress/index.html'), stressHtml);
+
+console.log('[copy-stress] dist/stress/ ready (with /vendor → ../vendor rewrite)');

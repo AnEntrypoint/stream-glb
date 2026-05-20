@@ -23,17 +23,22 @@ const readyPromise = new Promise((r) => { readyResolve = r; });
 
 (async () => {
   try {
-    // Use esm.sh which rewrites the bare specifier `three` (used inside
-    // GLTFLoader / meshopt_decoder) into a real URL — module workers do
-    // NOT inherit the page's <script type="importmap">, so vanilla
-    // cdn.jsdelivr.net URLs fail with "Failed to resolve module specifier 'three'".
-    // The ?deps pin keeps every import on the same three.js version so we
-    // don't end up with two THREE.* runtimes in the worker.
-    const threeMod = await import('https://esm.sh/three@0.170.0');
+    // Module workers do NOT inherit the page's <script type="importmap">,
+    // so bare `three` specifiers fail to resolve. We vendored three.js +
+    // GLTFLoader + meshopt_decoder under /vendor/three/ and rewrote the
+    // bare `three` imports in the vendored copies to relative paths so
+    // a single THREE.* runtime is shared across the worker.
+    // Build absolute URLs relative to this worker's URL so the path works
+    // both locally (served at /runtime/lod-worker.js) and on GH Pages
+    // (served at /stream-glb/runtime/lod-worker.js).
+    const threeURL   = new URL('../vendor/three/build/three.module.js', import.meta.url).href;
+    const gltfURL    = new URL('../vendor/three/examples/jsm/loaders/GLTFLoader.js', import.meta.url).href;
+    const meshoptURL = new URL('../vendor/three/examples/jsm/libs/meshopt_decoder.module.js', import.meta.url).href;
+    const threeMod = await import(threeURL);
     THREE = threeMod;
-    const gltfMod = await import('https://esm.sh/three@0.170.0/examples/jsm/loaders/GLTFLoader.js?deps=three@0.170.0');
+    const gltfMod = await import(gltfURL);
     GLTFLoader = gltfMod.GLTFLoader;
-    const meshoptMod = await import('https://esm.sh/three@0.170.0/examples/jsm/libs/meshopt_decoder.module.js?deps=three@0.170.0');
+    const meshoptMod = await import(meshoptURL);
     MeshoptDecoder = meshoptMod.MeshoptDecoder;
     loader = new GLTFLoader();
     loader.setMeshoptDecoder(MeshoptDecoder);

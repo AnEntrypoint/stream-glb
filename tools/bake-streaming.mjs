@@ -39,7 +39,11 @@ const EXTRA_LOD_STAGES = [
   { ratio: 0.04, kind: 'vertcolor' },
   { ratio: 0.01, kind: 'unskinned' },
 ];
-const TEX_LOD_SIZES = [2048, 1024, 512, 256];
+// Texture LOD pyramid sizes. MAX_TEX_SIZE caps the largest face so individual
+// bakes can be kept under GitHub's 50MB warning threshold for problematic
+// inputs. Set via env: MAX_TEX_SIZE=1024 node tools/bake-streaming.mjs ...
+const MAX_TEX_SIZE = parseInt(process.env.MAX_TEX_SIZE || '2048', 10);
+const TEX_LOD_SIZES = [2048, 1024, 512, 256].filter((s) => s <= MAX_TEX_SIZE);
 
 // ---------- sRGB conversion + vertex-color baking (copied from bake-progressive) ----------
 const SRGB_TO_LINEAR = new Float32Array(256);
@@ -271,7 +275,13 @@ async function main() {
 
   const sourceDoc = await io.read(INPUT);
   const sourceRoot = sourceDoc.getRoot();
-  console.log(`[bake-streaming] meshes=${sourceRoot.listMeshes().length} textures=${sourceRoot.listTextures().length}`);
+  const meshCount = sourceRoot.listMeshes().length;
+  const texCount = sourceRoot.listTextures().length;
+  console.log(`[bake-streaming] meshes=${meshCount} textures=${texCount}`);
+  if (meshCount === 0) {
+    console.error('[bake-streaming] input has no meshes — skipping');
+    process.exit(2);
+  }
 
   // ---------------- Step 1: build per-primitive LODs ----------------
   // For each LOD, we record raw attribute typed-array bytes + accessor metadata.
@@ -339,8 +349,15 @@ async function main() {
         return { ratio, kind, semantics, attrs, indices, decodeAABB };
       }
 
-      // Standard textured LODs.
-      for (const ratio of MESH_LOD_RATIOS) {
+      // Standard textured LODs. For very dense meshes (>500k verts) skip
+      // ratio=1.0 — keeping full-density geometry per-LOD bloats output to
+      // 50+MB. The 0.4 ratio LOD becomes the HERO tier for these assets.
+      const sourcePrim = sourceRoot.listMeshes()[mi].listPrimitives()[pi];
+      const posAcc = sourcePrim.getAttribute('POSITION');
+      const denseSrc = posAcc && posAcc.getCount() > 500_000;
+      const ratios = denseSrc ? MESH_LOD_RATIOS.filter((r) => r < 1.0) : MESH_LOD_RATIOS;
+      if (denseSrc) console.log(`[bake-streaming]   dense source (${posAcc.getCount()} verts) — dropping ratio=1.0 LOD`);
+      for (const ratio of ratios) {
         const cloneDoc = cloneDocument(sourceDoc);
         const cMesh = cloneDoc.getRoot().listMeshes()[mi];
         cMesh.listPrimitives().forEach((p, idx) => { if (idx !== pi) cMesh.removePrimitive(p); });

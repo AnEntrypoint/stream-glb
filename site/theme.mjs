@@ -10,8 +10,11 @@ const escapeJson = (obj) => JSON.stringify(obj)
   .replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/&/g, '\\u0026')
   .replace(new RegExp('\\u2028', 'g'), '\\u2028').replace(new RegExp('\\u2029', 'g'), '\\u2029');
 
-const SDK_URL = 'https://unpkg.com/anentrypoint-design@latest/dist/247420.js';
-const SDK_CSS = 'https://unpkg.com/anentrypoint-design@latest/dist/247420.css';
+// Vendored locally under vendor/anentrypoint-design/ so the site is fully
+// self-contained (no third-party CDN). Path is relative so it works at both
+// the repo root (local serve.mjs) and under /stream-glb/ on GH Pages.
+const SDK_URL = './vendor/anentrypoint-design/247420.js';
+const SDK_CSS = './vendor/anentrypoint-design/247420.css';
 
 const clientScript = `
 import { h, applyDiff, installStyles, components as C, initTheme } from 'anentrypoint-design';
@@ -210,7 +213,6 @@ const html = ({ site, nav, home }) => {
   <script type="application/ld+json">${ldJson}</script>
   <script type="importmap">{"imports":{"anentrypoint-design":"${SDK_URL}"}}</script>
   <link rel="stylesheet" href="${SDK_CSS}">
-  <link rel="preconnect" href="https://unpkg.com" crossorigin>
   <style>html,body{margin:0;padding:0}body{background:var(--app-bg,#FBF6EB);color:var(--ink,#1F1B16);font-family:var(--ff-ui,'Nunito',system-ui,sans-serif)}html:not(.ds-ready) body{visibility:hidden}html.ds-ready body{visibility:visible;animation:ds-fade-in .18s ease-out both}@keyframes ds-fade-in{from{opacity:0}to{opacity:1}}</style>
   <noscript><style>html body{visibility:visible !important}</style></noscript>
 </head>
